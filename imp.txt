@@ -6,34 +6,9 @@ open class MemoryService(
     private val failOpen: FailOpen,
 ) {
 
-    companion object {
-        private const val DEFAULT_CONTEXT_WINDOW = 20
-    }
-
-    open suspend fun appendTurn(
-        turn: ConversationTurn,
-        metadata: SessionMetadata,
-    ) {
-        sessionMemoryRepository.appendTurn(
-            sessionId = metadata.sessionId,
-            turn = turn,
-        )
-
-        failOpen.failOpenWrite(
-            operation = "updateSessionIndex",
-        ) {
-            sessionIndexRepository.upsertSessionOnTurn(metadata)
-        }
-
-        failOpen.failOpenWrite(
-            operation = "invalidateContextCache",
-        ) {
-            contextCacheRepository.evict(metadata.sessionId)
-        }
-    }
-
     open suspend fun getConversationContext(
         sessionId: String,
+        window: Int = 20,
     ): String? {
         val cachedContext =
             failOpen.failOpenRead(
@@ -48,16 +23,32 @@ open class MemoryService(
         }
 
         val turns =
-            getRecentTurns(
-                sessionId = sessionId,
-                limit = DEFAULT_CONTEXT_WINDOW,
-            )
+            failOpen.failOpenRead(
+                operation = "getRecentTurns",
+                default = emptyList(),
+            ) {
+                sessionMemoryRepository.getRecentTurns(
+                    sessionId = sessionId,
+                    window = window,
+                )
+            }
 
         if (turns.isEmpty()) {
             return null
         }
 
-        val context = buildConversationContext(turns)
+        val context =
+            turns.joinToString("\n\n") { turn ->
+                buildString {
+                    appendLine("Usuário: ${turn.question}")
+
+                    turn.answer
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let {
+                            append("Assistente: $it")
+                        }
+                }
+            }
 
         failOpen.failOpenWrite(
             operation = "cacheConversationContext",
@@ -71,222 +62,34 @@ open class MemoryService(
         return context
     }
 
-    open suspend fun getRecentTurns(
-        sessionId: String,
-        limit: Int = DEFAULT_CONTEXT_WINDOW,
-    ): List<ConversationTurn> {
-        return failOpen.failOpenRead(
-            operation = "getRecentTurns",
-            default = emptyList(),
-        ) {
-            sessionMemoryRepository.getRecentTurns(
-                sessionId = sessionId,
-                window = limit,
-            )
-        }
-    }
-
-    open suspend fun listTurns(
-        sessionId: String,
-        page: Int,
-        size: Int,
-    ): PageResponse<ConversationTurn> {
-        return failOpen.failOpenRead(
-            operation = "listTurns",
-            default = emptyTurnPage(
-                page = page,
-                size = size,
-            ),
-        ) {
-            sessionMemoryRepository.getTurns(
-                sessionId = sessionId,
-                page = page,
-                size = size,
-            )
-        }
-    }
-
-    open suspend fun listSessions(
-        userId: String,
-        page: Int,
-        size: Int,
-    ): PageResponse<SessionMetadata> {
-        return failOpen.failOpenRead(
-            operation = "listSessions",
-            default = emptySessionPage(
-                page = page,
-                size = size,
-            ),
-        ) {
-            sessionIndexRepository.listByUser(
-                namUser = userId,
-                page = page,
-                size = size,
-            )
-        }
-    }
-
-    open suspend fun findSession(
-        sessionId: String,
-    ): SessionMetadata? {
-        return failOpen.failOpenRead(
-            operation = "findSession",
-            default = null,
-        ) {
-            sessionIndexRepository.getSession(sessionId)
-        }
-    }
-
-    open suspend fun findTurn(
-        sessionId: String,
-        chatHistoryId: String,
-    ): ConversationTurn? {
-        return failOpen.failOpenRead(
-            operation = "findTurn",
-            default = null,
-        ) {
-            sessionMemoryRepository.findTurn(
-                sessionId = sessionId,
-                chatHistoryId = chatHistoryId,
-            )
-        }
-    }
-
-    open suspend fun updateSessionStatus(
-        sessionId: String,
-        status: SessionStatus,
-    ): Boolean {
-        return failOpen.failOpenWrite(
-            operation = "updateSessionStatus",
-            default = false,
-        ) {
-            sessionIndexRepository.updateStatus(
-                sessionId = sessionId,
-                status = status,
-            )
-        }
-    }
-
-    open suspend fun resetConversationContext(
-        sessionId: String,
+    open suspend fun appendTurn(
+        turn: ConversationTurn,
         metadata: SessionMetadata,
     ) {
+        sessionMemoryRepository.appendTurn(
+            sessionId = metadata.sessionId,
+            turn = turn,
+        )
+
         failOpen.failOpenWrite(
-            operation = "clearConversationTurns",
+            operation = "markTurnPendingPersistence",
         ) {
-            sessionMemoryRepository.clearTurns(sessionId)
+            sessionMemoryRepository.insertPendingTurn(
+                sessionId = metadata.sessionId,
+                chatHistoryId = turn.chatHistoryId,
+            )
         }
 
         failOpen.failOpenWrite(
-            operation = "updateSessionIndexAfterContextReset",
+            operation = "updateSessionIndex",
         ) {
             sessionIndexRepository.upsertSessionOnTurn(metadata)
         }
 
         failOpen.failOpenWrite(
-            operation = "evictConversationContextCache",
+            operation = "invalidateConversationContext",
         ) {
-            contextCacheRepository.evict(sessionId)
+            contextCacheRepository.evict(metadata.sessionId)
         }
     }
-
-    private fun buildConversationContext(
-        turns: List<ConversationTurn>,
-    ): String {
-        return turns.joinToString("\n\n") { turn ->
-            buildString {
-                appendLine("Usuário: ${turn.question}")
-
-                turn.answer
-                    ?.takeIf { it.isNotBlank() }
-                    ?.let {
-                        append("Assistente: $it")
-                    }
-            }
-        }
-    }
-
-    private fun emptyTurnPage(
-        page: Int,
-        size: Int,
-    ): PageResponse<ConversationTurn> {
-        return PageResponse(
-            content = emptyList(),
-            total = 0,
-            page = page,
-            size = size,
-        )
-    }
-
-    private fun emptySessionPage(
-        page: Int,
-        size: Int,
-    ): PageResponse<SessionMetadata> {
-        return PageResponse(
-            content = emptyList(),
-            total = 0,
-            page = page,
-            size = size,
-        )
-    }
-}
-
------
-fun processQuestion(
-    request: ChatAskRequest,
-    appName: String?,
-    correlationId: String?,
-): Flow<ChatStreamEvent> = channelFlow {
-
-    val sessionId =
-        request.sessionId ?: UUID.randomUUID().toString()
-
-    val conversationContext =
-        memoryService.getConversationContext(sessionId)
-
-    val response =
-        generateMockResponse(
-            question = request.question,
-            requestContext = request.context,
-            conversationContext = conversationContext,
-        )
-
-    val answer = StringBuilder()
-
-    response.chunked(20).forEach { chunk ->
-
-        delay(200)
-
-        answer.append(chunk)
-
-        send(
-            ChatStreamEvent.chunk(
-                sessionId = sessionId,
-                content = chunk,
-            )
-        )
-    }
-
-    val turn =
-        buildTurn(
-            sessionId = sessionId,
-            request = request,
-            answer = answer.toString(),
-        )
-
-    val session =
-        buildSessionMetadata(
-            sessionId = sessionId,
-            request = request,
-            appName = appName,
-        )
-
-    memoryService.appendTurn(
-        turn = turn,
-        session = session,
-    )
-
-    send(
-        ChatStreamEvent.done(sessionId)
-    )
 }
