@@ -10,16 +10,33 @@ open class MemoryService(
         turn: ConversationTurn,
         userId: String?,
     ) {
+        /*
+         * Obrigatórios:
+         *
+         * iara:memory:{sessionId}
+         * iara:order:{sessionId}
+         */
         sessionMemoryRepository.appendTurn(
             sessionId = turn.sessionId,
             turn = turn,
         )
 
+        /*
+         * Obrigatório para posterior persistência no Oracle.
+         *
+         * iara:pending
+         * chatHistoryId -> sessionId
+         */
         sessionMemoryRepository.addPendingTurn(
             sessionId = turn.sessionId,
             chatHistoryId = turn.chatHistoryId,
         )
 
+        /*
+         * Índice auxiliar para listagem das sessões do usuário.
+         *
+         * iara:sessions:{userId}
+         */
         userId?.let {
             failOpen.failOpenWrite(
                 operation = "touchUserSession",
@@ -31,6 +48,9 @@ open class MemoryService(
             }
         }
 
+        /*
+         * Um novo turno torna o contexto cacheado obsoleto.
+         */
         failOpen.failOpenWrite(
             operation = "evictConversationContext",
         ) {
@@ -107,6 +127,20 @@ open class MemoryService(
             )
         }
 
+    open suspend fun findTurn(
+        sessionId: String,
+        chatHistoryId: String,
+    ): ConversationTurn? =
+        failOpen.failOpenRead(
+            operation = "findTurn",
+            default = null,
+        ) {
+            sessionMemoryRepository.findTurn(
+                sessionId = sessionId,
+                chatHistoryId = chatHistoryId,
+            )
+        }
+
     open suspend fun listSessionIds(
         userId: String,
         page: Int,
@@ -128,34 +162,12 @@ open class MemoryService(
             )
         }
 
-    open suspend fun findTurn(
-        sessionId: String,
-        chatHistoryId: String,
-    ): ConversationTurn? =
-        failOpen.failOpenRead(
-            operation = "findTurn",
-            default = null,
-        ) {
-            sessionMemoryRepository.findTurn(
-                sessionId = sessionId,
-                chatHistoryId = chatHistoryId,
-            )
-        }
-
-    open suspend fun countTurns(
-        sessionId: String,
-    ): Long =
-        failOpen.failOpenRead(
-            operation = "countTurns",
-            default = 0L,
-        ) {
-            sessionMemoryRepository.countTurns(sessionId)
-        }
-
     open suspend fun findPendingTurns(
         limit: Long,
     ): List<PendingTurnReference> =
-        sessionMemoryRepository.findPendingTurns(limit)
+        sessionMemoryRepository.findPendingTurns(
+            limit = limit,
+        )
 
     open suspend fun markTurnAsPersisted(
         sessionId: String,
@@ -165,16 +177,6 @@ open class MemoryService(
             sessionId = sessionId,
             chatHistoryId = chatHistoryId,
             persistStatus = PersistStatus.PERSISTED,
-        )
-
-    open suspend fun markTurnAsPending(
-        sessionId: String,
-        chatHistoryId: String,
-    ): Boolean =
-        sessionMemoryRepository.updateTurnPersistenceStatus(
-            sessionId = sessionId,
-            chatHistoryId = chatHistoryId,
-            persistStatus = PersistStatus.PENDING,
         )
 
     open suspend fun evictConversationContext(
@@ -204,5 +206,3 @@ open class MemoryService(
             }
         }
 }
-
------
