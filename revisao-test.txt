@@ -1,0 +1,261 @@
+Quero que você revise e atualize os testes unitários e de integração afetados pelas mudanças recentes no fluxo de memória, sessão, Redis e persistência.
+
+Antes de alterar qualquer arquivo, analise o código atual de produção e os testes existentes. Não assuma que os testes atuais representam o comportamento correto.
+
+Contexto funcional atual:
+
+* ChatService é uma implementação mock/simplificada usada para testes e integração com o front-end.
+* ChatImplService contém o comportamento real da aplicação.
+* MemoryService orquestra os repositories Redis.
+* O fluxo deve priorizar Redis quando houver dado disponível e usar Oracle como fallback ou fonte durável quando necessário.
+* Não existe mais a chave Redis iara:session:{sessionId}.
+* As estruturas Redis válidas atualmente são:
+    * iara:memory:{sessionId} → Hash
+    * iara:order:{sessionId} → Sorted Set
+    * iara:sessions:{userId} → Sorted Set
+    * iara:pending → Hash
+    * iara:context:{sessionId} → utilizar exatamente o contrato atualmente implementado em ContextCacheRepository; não inferir outro tipo.
+* Não recrie nenhuma estrutura Redis removida.
+* Não altere tipos de chave apenas para satisfazer testes antigos.
+* SessionMemoryRepository, SessionIndexRepository e ContextCacheRepository são responsáveis pelas operações Redis.
+* O projeto utiliza Redis reativo.
+* Alguns repositories Oracle utilizam APIs coroutine/suspend.
+* Se um repository já expõe um método suspend, não adicione awaitSingle(), awaitSingleOrNull() ou outra conversão Reactor desnecessária.
+
+Regras de fonte de verdade:
+
+1. O comportamento atual do código de produção, juntamente com os contratos descritos acima, deve ser considerado a principal referência.
+2. Testes antigos podem estar desatualizados.
+3. Não altere código de produção apenas para fazer um teste antigo passar.
+4. Se um teste estiver esperando um método, chave Redis, contrato ou comportamento que não existe mais, corrija o teste.
+5. Se identificar algo que pareça ser realmente um bug no código de produção, não corrija automaticamente.
+6. Nesse caso, pare e apresente:
+    * arquivo;
+    * classe;
+    * método;
+    * comportamento atual;
+    * comportamento esperado;
+    * por que considera isso um bug;
+    * alteração sugerida.
+7. Aguarde minha autorização antes de alterar código de produção nesse caso.
+
+Permissões:
+
+* Você pode alterar livremente:
+    * arquivos de teste;
+    * mocks;
+    * stubs;
+    * fixtures;
+    * builders exclusivos de teste;
+    * factories exclusivas de teste;
+    * utilitários exclusivos de teste;
+    * configurações de teste quando necessárias.
+* Não altere automaticamente:
+    * services de produção;
+    * controllers;
+    * repositories de produção;
+    * entidades;
+    * DTOs de produção;
+    * configurações de produção.
+
+Objetivo:
+
+Identifique todos os testes unitários e de integração afetados pelas alterações em:
+
+* MemoryService
+* SessionMemoryRepository
+* SessionIndexRepository
+* ContextCacheRepository
+* ChatImplService
+* classes que chamam esses componentes
+
+Depois, atualize ou crie os testes necessários para refletir o comportamento atual.
+
+Cenários mínimos que devem ser avaliados:
+
+MemoryService
+
+* append de um novo turno;
+* persistência do turno na memória Redis;
+* atualização da estrutura de ordenação do histórico;
+* atualização do índice de sessões do usuário;
+* inclusão do turno em iara:pending;
+* invalidação do contexto após append;
+* recuperação do contexto recente;
+* paginação de histórico;
+* contagem de turnos;
+* busca de turno específico;
+* atualização de persistStatus, quando aplicável;
+* limpeza dos turnos da sessão;
+* limpeza do cache de contexto.
+
+SessionMemoryRepository
+
+* appendTurn;
+* leitura paginada;
+* leitura de turnos recentes;
+* findTurn;
+* countTurns;
+* atualização de persist status;
+* manipulação de pending;
+* remoção das chaves corretas;
+* garantir que não exista nenhuma referência à antiga iara:session:{sessionId}.
+
+SessionIndexRepository
+
+* atualização de iara:sessions:{userId};
+* uso correto de Sorted Set;
+* score correspondente ao último acesso;
+* listagem das sessões do usuário;
+* paginação;
+* TTL, quando aplicável;
+* ausência completa de operações relacionadas a iara:session:{sessionId}.
+
+ContextCacheRepository
+
+* escrita;
+* leitura;
+* expiração;
+* evicção;
+* respeito ao tipo Redis utilizado pela implementação atual.
+
+ChatImplService
+
+Avalie especialmente:
+
+* getSession;
+* listSessions;
+* clearSessionContext;
+* registerFeedback;
+* demais métodos que utilizam MemoryService, Redis ou Oracle.
+
+Para getSession, valide:
+
+* Redis deve ser consultado primeiro para o histórico;
+* se Redis possuir os dados necessários, eles devem ser utilizados;
+* se Redis não possuir o histórico necessário, deve ocorrer fallback para Oracle;
+* Oracle não deve ser usado como pré-condição para consultar Redis;
+* metadata que não existe mais no Redis deve ser obtida da fonte durável adequada;
+* sessão inexistente deve produzir o comportamento HTTP esperado.
+
+Para listSessions, valide:
+
+* caminho principal utilizando Redis quando o contrato permitir;
+* fallback para Oracle quando necessário;
+* comportamento do filtro de status;
+* paginação;
+* não utilizar estruturas Redis inexistentes.
+
+Para registerFeedback, valide:
+
+* feedback pertence ao histórico durável;
+* consulta ao registro no Oracle;
+* atualização dos campos de feedback;
+* atualização de datUpdated;
+* comportamento para histórico inexistente.
+
+Testes de integração Redis:
+
+* não devem depender de dados existentes previamente;
+* cada cenário deve começar em estado conhecido;
+* prefira limpar apenas as chaves utilizadas pelo cenário;
+* evite FLUSHDB quando isso puder afetar outros testes ou processos;
+* use identificadores aleatórios quando necessário para isolamento;
+* valide o conteúdo armazenado;
+* quando relevante, valide também o tipo Redis da chave;
+* os tipos esperados são:
+    * memory → hash
+    * order → zset
+    * sessions → zset
+    * pending → hash
+* não crie chaves antigas para fazer testes passarem.
+
+Testes unitários:
+
+* mocke apenas as dependências externas à classe testada;
+* não mocke o próprio comportamento que está sendo testado;
+* mantenha os testes focados em comportamento, evitando detalhes internos desnecessários;
+* atualize verify, coVerify, every, coEvery, argumentos capturados e fixtures conforme os novos contratos;
+* remova mocks de métodos que não existem mais;
+* não recrie métodos em produção para satisfazer mocks antigos.
+
+Preserve:
+
+* biblioteca de testes já utilizada no projeto;
+* padrão de nomenclatura;
+* organização dos testes;
+* estilo de assertions;
+* convenções de mocks;
+* estrutura de fixtures já existente quando ainda fizer sentido.
+
+Não introduza uma nova biblioteca de testes sem necessidade.
+
+Processo obrigatório:
+
+Fase 1 — análise:
+
+1. Localize os testes impactados.
+2. Não altere nenhum arquivo ainda.
+3. Para cada teste problemático, classifique o problema como:
+    * teste desatualizado;
+    * mock/stub desatualizado;
+    * fixture desatualizada;
+    * contrato removido;
+    * expectativa incorreta;
+    * problema de infraestrutura/configuração;
+    * possível bug no código de produção.
+4. Liste os arquivos que pretende modificar.
+5. Explique resumidamente a alteração necessária em cada um.
+
+Fase 2 — implementação:
+
+Após concluir a análise, pode corrigir automaticamente apenas itens classificados como:
+
+* teste desatualizado;
+* mock/stub desatualizado;
+* fixture desatualizada;
+* contrato removido;
+* expectativa incorreta;
+* configuração exclusiva de teste.
+
+Para qualquer item classificado como possível bug no código de produção, não faça a alteração. Apenas reporte.
+
+Fase 3 — execução:
+
+1. Rode primeiro os testes diretamente relacionados aos arquivos alterados.
+2. Corrija problemas de compilação dos testes.
+3. Rode novamente.
+4. Depois rode o conjunto maior de testes do módulo afetado, se viável.
+5. Não faça alterações aleatórias em produção para tornar a suíte verde.
+
+Se um teste falhar, determine primeiro se a causa é:
+
+* expectativa antiga;
+* mock incorreto;
+* problema de isolamento;
+* dado Redis legado;
+* configuração de teste;
+* possível bug de produção.
+
+Resultado final esperado:
+
+Ao concluir, me apresente um resumo contendo:
+
+* arquivos de teste alterados;
+* testes novos criados;
+* testes removidos ou substituídos;
+* cenários cobertos;
+* quantidade de testes executados;
+* testes que passaram;
+* testes que continuam falhando;
+* motivo das falhas restantes;
+* possíveis bugs encontrados no código de produção;
+* qualquer ponto em que você evitou alterar produção por falta de certeza.
+
+Restrição final:
+
+Não faça refatorações fora do escopo.
+
+Não tente deixar a suíte verde a qualquer custo.
+
+Prefira um teste corretamente atualizado e uma possível falha de produção explicitamente reportada a modificar código de produção para satisfazer um teste antigo.
