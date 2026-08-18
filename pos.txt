@@ -242,3 +242,24 @@ private suspend fun listSessionsFromOracle(
 suspend fun findBySessionIds(
     sessionIds: List<String>,
 ): List<SessionMetadata>
+
+----
+
+override suspend fun findBySessionIds(
+    sessionIds: List<String>,
+): List<SessionMetadata> {
+    if (sessionIds.isEmpty()) {
+        return emptyList()
+    }
+
+    return Flux
+        .fromIterable(sessionIds)
+        .flatMap { sessionId ->
+            mono {
+                findBySessionId(sessionId)
+            }
+        }
+        .filterNotNull()
+        .collectList()
+        .awaitSingle()
+}
