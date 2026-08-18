@@ -133,3 +133,112 @@ open suspend fun listSessions(
         empty = content.isEmpty(),
     )
 }
+
+-----
+
+private fun SessionMetadata.toSessionSummaryResponse():
+    SessionSummaryResponse =
+    SessionSummaryResponse(
+        sessionId = sessionId,
+        namSession = namSession,
+        status = status,
+        system = system,
+        createdAt = createdAt,
+        messagesCount = messagesCount,
+    )
+
+
+private suspend fun listSessionsFromOracle(
+    namUser: String,
+    page: Int,
+    size: Int,
+    status: SessionStatus?,
+    appName: String?,
+): PageResponse<SessionSummaryResponse> {
+
+    var criteria =
+        Criteria
+            .where("namuser")
+            .`is`(namUser)
+
+    status?.let {
+        criteria =
+            criteria
+                .and("flgstatus")
+                .`is`(it)
+    }
+
+    appName
+        ?.takeIf { it.isNotBlank() }
+        ?.let {
+            criteria =
+                criteria
+                    .and("namsystem")
+                    .`is`(it)
+        }
+
+    val query =
+        Query
+            .query(criteria)
+            .sort(
+                Sort.by(
+                    Sort.Direction.DESC,
+                    "datcreated",
+                )
+            )
+            .limit(size)
+            .offset(
+                page.toLong() * size
+            )
+
+    val sessions =
+        template
+            .select(
+                query,
+                ChatSession::class.java,
+            )
+            .collectList()
+            .awaitSingle()
+
+    val total =
+        template
+            .count(
+                Query.query(criteria),
+                ChatSession::class.java,
+            )
+            .awaitSingle()
+
+    val content =
+        sessions.map { session ->
+
+            val messagesCount =
+                chatHistoryRepository.countByIdtSession(
+                    session.idtSession,
+                )
+
+            SessionSummaryResponse(
+                sessionId = session.idtSession,
+                namSession = session.namSession,
+                status = session.flgStatus,
+                system = session.namSystem,
+                createdAt = session.datCreated,
+                messagesCount = messagesCount,
+            )
+        }
+
+    return PageResponse.of(
+        content = content,
+        total = total,
+        page = page,
+        size = size,
+    )
+}
+
+
+
+----//
+
+
+suspend fun findBySessionIds(
+    sessionIds: List<String>,
+): List<SessionMetadata>
