@@ -1,208 +1,105 @@
 @Service
-open class MemoryService(
-    private val sessionMemoryRepository: SessionMemoryRepository,
-    private val sessionIndexRepository: SessionIndexRepository,
-    private val contextCacheRepository: ContextCacheRepository,
-    private val failOpen: FailOpen,
+class ChatService(
+    private val memoryService: MemoryService,
 ) {
 
-    open suspend fun appendTurn(
-        turn: ConversationTurn,
-        userId: String?,
-    ) {
-        /*
-         * Obrigatórios:
-         *
-         * iara:memory:{sessionId}
-         * iara:order:{sessionId}
-         */
-        sessionMemoryRepository.appendTurn(
-            sessionId = turn.sessionId,
-            turn = turn,
-        )
+    fun processQuestion(
+        request: ChatAskRequest,
+        appName: String?,
+        correlationId: String?,
+    ): Flow<ChatStreamEvent> = channelFlow {
 
-        /*
-         * Obrigatório para posterior persistência no Oracle.
-         *
-         * iara:pending
-         * chatHistoryId -> sessionId
-         */
-        sessionMemoryRepository.addPendingTurn(
-            sessionId = turn.sessionId,
-            chatHistoryId = turn.chatHistoryId,
-        )
+        val sessionId =
+            request.sessionId
+                ?: UUID.randomUUID().toString()
 
-        /*
-         * Índice auxiliar para listagem das sessões do usuário.
-         *
-         * iara:sessions:{userId}
-         */
-        userId?.let {
-            failOpen.failOpenWrite(
-                operation = "touchUserSession",
-            ) {
-                sessionIndexRepository.touch(
-                    userId = it,
-                    sessionId = turn.sessionId,
-                )
-            }
-        }
+        val chatHistoryId =
+            UUID.randomUUID().toString()
 
-        /*
-         * Um novo turno torna o contexto cacheado obsoleto.
-         */
-        failOpen.failOpenWrite(
-            operation = "evictConversationContext",
-        ) {
-            contextCacheRepository.evict(
-                turn.sessionId,
+        val conversationContext =
+            memoryService.getConversationContext(
+                sessionId = sessionId,
             )
-        }
-    }
 
-    open suspend fun getConversationContext(
-        sessionId: String,
-        limit: Int? = null,
-    ): String? {
-        val cachedContext =
-            failOpen.failOpenRead(
-                operation = "findConversationContext",
-                default = null,
-            ) {
-                contextCacheRepository.find(sessionId)
-            }
+        send(
+            ChatStreamEvent(
+                type = "session",
+                sessionId = sessionId,
+            )
+        )
 
-        if (!cachedContext.isNullOrBlank()) {
-            return cachedContext
-        }
+        val completeResponse =
+            generateMockResponse(
+                question = request.question,
+                requestContext = request.context,
+                conversationContext = conversationContext,
+            )
 
-        val turns =
-            failOpen.failOpenRead(
-                operation = "findRecentTurns",
-                default = emptyList(),
-            ) {
-                sessionMemoryRepository.findRecentTurns(
-                    sessionId = sessionId,
-                    limit = limit,
+        val answerBuilder = StringBuilder()
+
+        completeResponse
+            .chunked(CHUNK_SIZE)
+            .forEach { chunk ->
+
+                delay(CHUNK_DELAY)
+
+                answerBuilder.append(chunk)
+
+                send(
+                    ChatStreamEvent(
+                        type = "chunk",
+                        sessionId = sessionId,
+                        content = chunk,
+                    )
                 )
             }
 
-        if (turns.isEmpty()) {
-            return null
-        }
-
-        val context =
-            buildConversationContext(turns)
-
-        failOpen.failOpenWrite(
-            operation = "saveConversationContext",
-        ) {
-            contextCacheRepository.save(
-                sessionId = sessionId,
-                context = context,
-            )
-        }
-
-        return context
-    }
-
-    open suspend fun listTurns(
-        sessionId: String,
-        page: Int,
-        size: Int,
-    ): PageResponse<ConversationTurn> =
-        failOpen.failOpenRead(
-            operation = "listTurns",
-            default = PageResponse.of(
-                content = emptyList(),
-                total = 0,
-                page = page,
-                size = size,
-            ),
-        ) {
-            sessionMemoryRepository.listTurns(
-                sessionId = sessionId,
-                page = page,
-                size = size,
-            )
-        }
-
-    open suspend fun findTurn(
-        sessionId: String,
-        chatHistoryId: String,
-    ): ConversationTurn? =
-        failOpen.failOpenRead(
-            operation = "findTurn",
-            default = null,
-        ) {
-            sessionMemoryRepository.findTurn(
+        val turn =
+            ConversationTurn(
                 sessionId = sessionId,
                 chatHistoryId = chatHistoryId,
+                question = request.question,
+                answer = answerBuilder.toString(),
+                persistStatus = PersistStatus.PENDING,
+                // demais campos reais do seu model
             )
-        }
 
-    open suspend fun listSessionIds(
-        userId: String,
-        page: Int,
-        size: Int,
-    ): PageResponse<String> =
-        failOpen.failOpenRead(
-            operation = "listSessionIds",
-            default = PageResponse.of(
-                content = emptyList(),
-                total = 0,
-                page = page,
-                size = size,
-            ),
-        ) {
-            sessionIndexRepository.listByUser(
-                userId = userId,
-                page = page,
-                size = size,
-            )
-        }
-
-    open suspend fun findPendingTurns(
-        limit: Long,
-    ): List<PendingTurnReference> =
-        sessionMemoryRepository.findPendingTurns(
-            limit = limit,
+        memoryService.appendTurn(
+            turn = turn,
+            userId = request.namUser,
         )
 
-    open suspend fun markTurnAsPersisted(
-        sessionId: String,
-        chatHistoryId: String,
-    ): Boolean =
-        sessionMemoryRepository.updateTurnPersistenceStatus(
-            sessionId = sessionId,
-            chatHistoryId = chatHistoryId,
-            persistStatus = PersistStatus.PERSISTED,
+        send(
+            ChatStreamEvent(
+                type = "done",
+                sessionId = sessionId,
+            )
         )
-
-    open suspend fun evictConversationContext(
-        sessionId: String,
-    ) {
-        failOpen.failOpenWrite(
-            operation = "evictConversationContext",
-        ) {
-            contextCacheRepository.evict(sessionId)
-        }
     }
 
-    private fun buildConversationContext(
-        turns: List<ConversationTurn>,
-    ): String =
-        turns.joinToString(separator = "\n\n") { turn ->
-            buildString {
-                append("Usuário: ")
-                append(turn.question)
+    private fun generateMockResponse(
+        question: String,
+        requestContext: Map<String, String>?,
+        conversationContext: String?,
+    ): String {
+        // ÚNICO MOCK.
+        // Mantemos aqui enquanto não houver integração real com o agente.
 
-                turn.answer
-                    ?.takeIf { it.isNotBlank() }
-                    ?.let { answer ->
-                        append("\nAssistente: ")
-                        append(answer)
-                    }
-            }
-        }
+        return """
+            Pergunta recebida: $question
+
+            Contexto da requisição:
+            ${requestContext.orEmpty()}
+
+            Contexto da conversa:
+            ${conversationContext ?: "Sem histórico anterior."}
+
+            Esta é uma resposta simulada do agente Iara.
+        """.trimIndent()
+    }
+
+    companion object {
+        private const val CHUNK_SIZE = 20
+        private const val CHUNK_DELAY = 200L
+    }
 }
