@@ -1,0 +1,112 @@
+@Service
+open class MemoryService(
+    private val sessionMemoryRepository: SessionMemoryRepository,
+    private val sessionIndexRepository: SessionIndexRepository,
+    private val contextCacheRepository: ContextCacheRepository,
+    private val failOpen: FailOpen,
+) {
+
+    open suspend fun appendTurn(
+        turn: ConversationTurn,
+        session: SessionMetadata,
+    )
+
+    open suspend fun getConversationContext(
+        sessionId: String,
+    ): String?
+
+    open suspend fun listTurns(
+        sessionId: String,
+        page: Int,
+        size: Int,
+        status: SessionStatus? = null,
+        appName: String? = null,
+        riskChatToken: String? = null,
+    ): PageResponse<ConversationTurn>
+
+    open suspend fun listSessions(
+        userId: String,
+        page: Int,
+        size: Int,
+    ): PageResponse<SessionMetadata>
+
+    open suspend fun findSession(
+        sessionId: String,
+    ): SessionMetadata?
+
+    open suspend fun findTurn(
+        sessionId: String,
+        chatHistoryId: String,
+    ): ConversationTurn?
+
+    open suspend fun updateSessionStatus(
+        sessionId: String,
+        status: SessionStatus,
+    ): Boolean
+
+    open suspend fun resetConversationContext(
+        sessionId: String,
+        metadata: SessionMetadata,
+    )
+}
+
+
+-----
+fun processQuestion(
+    request: ChatAskRequest,
+    appName: String?,
+    correlationId: String?,
+): Flow<ChatStreamEvent> = channelFlow {
+
+    val sessionId =
+        request.sessionId ?: UUID.randomUUID().toString()
+
+    val conversationContext =
+        memoryService.getConversationContext(sessionId)
+
+    val response =
+        generateMockResponse(
+            question = request.question,
+            requestContext = request.context,
+            conversationContext = conversationContext,
+        )
+
+    val answer = StringBuilder()
+
+    response.chunked(20).forEach { chunk ->
+
+        delay(200)
+
+        answer.append(chunk)
+
+        send(
+            ChatStreamEvent.chunk(
+                sessionId = sessionId,
+                content = chunk,
+            )
+        )
+    }
+
+    val turn =
+        buildTurn(
+            sessionId = sessionId,
+            request = request,
+            answer = answer.toString(),
+        )
+
+    val session =
+        buildSessionMetadata(
+            sessionId = sessionId,
+            request = request,
+            appName = appName,
+        )
+
+    memoryService.appendTurn(
+        turn = turn,
+        session = session,
+    )
+
+    send(
+        ChatStreamEvent.done(sessionId)
+    )
+}
