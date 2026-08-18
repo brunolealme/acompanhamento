@@ -1,110 +1,291 @@
-@Repository
-open class RedisContextCacheRepository(
-    private val redisTemplate: ReactiveStringRedisTemplate,
-    private val properties: IaraMemoryProperties,
-) : ContextCacheRepository {
+@Service
+open class MemoryService(
+    private val sessionMemoryRepository: SessionMemoryRepository,
+    private val sessionIndexRepository: SessionIndexRepository,
+    private val contextCacheRepository: ContextCacheRepository,
+    private val failOpen: FailOpen,
+) {
 
-    override suspend fun save(
-        sessionId: String,
-        context: String,
+    /**
+     * Registra um novo turno concluído.
+     *
+     * Operações obrigatórias:
+     * - iara:memory:{sessionId}
+     * - iara:order:{sessionId}
+     * - iara:pending
+     *
+     * Operações auxiliares/fail-open:
+     * - iara:sessions:{userId}
+     * - invalidação de iara:context:{sessionId}
+     */
+    open suspend fun appendTurn(
+        turn: ConversationTurn,
+        metadata: SessionMetadata,
     ) {
-        validateSessionId(sessionId)
+        sessionMemoryRepository.appendTurn(
+            sessionId = metadata.sessionId,
+            turn = turn,
+        )
 
-        val key =
-            CacheConstants.contextKey(
-                properties.keyPrefix,
-                sessionId,
-            )
+        sessionMemoryRepository.addPendingTurn(
+            sessionId = metadata.sessionId,
+            chatHistoryId = turn.chatHistoryId,
+        )
 
-        redisTemplate
-            .opsForHash<String, String>()
-            .put(
-                key,
-                CONTEXT_FIELD,
-                context,
-            )
-            .awaitSingle()
-
-        redisTemplate
-            .expire(
-                key,
-                properties.contextCache.ttl,
-            )
-            .awaitSingle()
-    }
-
-    override suspend fun find(
-        sessionId: String,
-    ): String? {
-        validateSessionId(sessionId)
-
-        val key =
-            CacheConstants.contextKey(
-                properties.keyPrefix,
-                sessionId,
-            )
-
-        return redisTemplate
-            .opsForHash<String, String>()
-            .get(
-                key,
-                CONTEXT_FIELD,
-            )
-            .awaitFirstOrNull()
-    }
-
-    override suspend fun evict(
-        sessionId: String,
-    ) {
-        validateSessionId(sessionId)
-
-        val key =
-            CacheConstants.contextKey(
-                properties.keyPrefix,
-                sessionId,
-            )
-
-        redisTemplate
-            .delete(key)
-            .awaitSingle()
-    }
-
-    private fun validateSessionId(
-        sessionId: String,
-    ) {
-        require(
-            sessionId.length <= MAX_IDENTIFIER_LENGTH
+        failOpen.failOpenWrite(
+            operation = "updateUserSessionIndex",
         ) {
-            "sessionId must have at most $MAX_IDENTIFIER_LENGTH characters"
+            sessionIndexRepository.upsertSessionOnTurn(metadata)
+        }
+
+        failOpen.failOpenWrite(
+            operation = "invalidateContextCache",
+        ) {
+            contextCacheRepository.evict(metadata.sessionId)
         }
     }
 
-    companion object {
-        private const val CONTEXT_FIELD = "context"
-        private const val MAX_IDENTIFIER_LENGTH = 40
+    /**
+     * Retorna o contexto textual que será enviado ao agente.
+     *
+     * 1. tenta iara:context:{sessionId}
+     * 2. em cache miss, busca últimos turnos
+     * 3. monta contexto
+     * 4. salva o contexto no cache
+     */
+    open suspend fun getConversationContext(
+        sessionId: String,
+        limit: Int? = null,
+    ): String? {
+        val cachedContext =
+            failOpen.failOpenRead(
+                operation = "findConversationContextCache",
+                default = null,
+            ) {
+                contextCacheRepository.find(sessionId)
+            }
+
+        if (!cachedContext.isNullOrBlank()) {
+            return cachedContext
+        }
+
+        val turns =
+            failOpen.failOpenRead(
+                operation = "findRecentTurns",
+                default = emptyList(),
+            ) {
+                sessionMemoryRepository.findRecentTurns(
+                    sessionId = sessionId,
+                    limit = limit,
+                )
+            }
+
+        if (turns.isEmpty()) {
+            return null
+        }
+
+        val context = buildConversationContext(turns)
+
+        failOpen.failOpenWrite(
+            operation = "saveConversationContextCache",
+        ) {
+            contextCacheRepository.save(
+                sessionId = sessionId,
+                context = context,
+            )
+        }
+
+        return context
     }
-}
------
 
-import kotlinx.coroutines.reactor.awaitSingle
-import kotlinx.coroutines.reactor.awaitFirstOrNull
-import org.springframework.data.redis.core.ReactiveStringRedisTemplate
-import org.springframework.stereotype.Repository
-
-
------
-interface ContextCacheRepository {
-
-    suspend fun save(
+    open suspend fun listTurns(
         sessionId: String,
-        context: String,
-    )
+        page: Int,
+        size: Int,
+    ): PageResponse<ConversationTurn> {
+        return failOpen.failOpenRead(
+            operation = "listTurns",
+            default = PageResponse.of(
+                content = emptyList(),
+                total = 0,
+                page = page,
+                size = size,
+            ),
+        ) {
+            sessionMemoryRepository.listTurns(
+                sessionId = sessionId,
+                page = page,
+                size = size,
+            )
+        }
+    }
 
-    suspend fun find(
+    open suspend fun findTurn(
         sessionId: String,
-    ): String?
+        chatHistoryId: String,
+    ): ConversationTurn? {
+        return failOpen.failOpenRead(
+            operation = "findTurn",
+            default = null,
+        ) {
+            sessionMemoryRepository.findTurn(
+                sessionId = sessionId,
+                chatHistoryId = chatHistoryId,
+            )
+        }
+    }
 
-    suspend fun evict(
+    open suspend fun countTurns(
         sessionId: String,
-    )
+    ): Long {
+        return failOpen.failOpenRead(
+            operation = "countTurns",
+            default = 0L,
+        ) {
+            sessionMemoryRepository.countTurns(sessionId)
+        }
+    }
+
+    /*
+     * Mantemos estes contratos do SessionIndexRepository por enquanto,
+     * pois ainda não revisamos essa interface.
+     */
+    open suspend fun listUserSessions(
+        userId: String,
+        page: Int,
+        size: Int,
+    ): PageResponse<SessionMetadata> {
+        return failOpen.failOpenRead(
+            operation = "listUserSessions",
+            default = PageResponse.of(
+                content = emptyList(),
+                total = 0,
+                page = page,
+                size = size,
+            ),
+        ) {
+            sessionIndexRepository.listByUser(
+                namUser = userId,
+                page = page,
+                size = size,
+            )
+        }
+    }
+
+    open suspend fun findSession(
+        sessionId: String,
+    ): SessionMetadata? {
+        return failOpen.failOpenRead(
+            operation = "findSession",
+            default = null,
+        ) {
+            sessionIndexRepository.getSession(sessionId)
+        }
+    }
+
+    open suspend fun updateSessionStatus(
+        sessionId: String,
+        status: SessionStatus,
+    ): Boolean {
+        return failOpen.failOpenWrite(
+            operation = "updateSessionStatus",
+            default = false,
+        ) {
+            sessionIndexRepository.updateStatus(
+                sessionId = sessionId,
+                status = status,
+            )
+        }
+    }
+
+    /**
+     * Utilizado pelo reconciliador.
+     *
+     * Não é fail-open: falhar aqui significa não conseguir localizar
+     * turnos que precisam ser persistidos no Oracle.
+     */
+    open suspend fun findPendingTurns(
+        limit: Long,
+    ): List<PendingTurnReference> {
+        return sessionMemoryRepository.findPendingTurns(limit)
+    }
+
+    /**
+     * Deve ser chamado somente após a persistência durável no Oracle.
+     *
+     * Ao mudar para PERSISTED, o repository também remove o
+     * chatHistoryId de iara:pending.
+     */
+    open suspend fun markTurnAsPersisted(
+        sessionId: String,
+        chatHistoryId: String,
+    ): Boolean {
+        return sessionMemoryRepository.updateTurnPersistenceStatus(
+            sessionId = sessionId,
+            chatHistoryId = chatHistoryId,
+            persistStatus = PersistStatus.PERSISTED,
+        )
+    }
+
+    open suspend fun markTurnAsPending(
+        sessionId: String,
+        chatHistoryId: String,
+    ): Boolean {
+        return sessionMemoryRepository.updateTurnPersistenceStatus(
+            sessionId = sessionId,
+            chatHistoryId = chatHistoryId,
+            persistStatus = PersistStatus.PENDING,
+        )
+    }
+
+    /**
+     * Apenas invalida o contexto já montado.
+     *
+     * NÃO apaga os turnos.
+     */
+    open suspend fun evictConversationContext(
+        sessionId: String,
+    ) {
+        failOpen.failOpenWrite(
+            operation = "evictConversationContext",
+        ) {
+            contextCacheRepository.evict(sessionId)
+        }
+    }
+
+    /**
+     * Operação destrutiva.
+     *
+     * Não deve ser usada pelo endpoint "clear context" até validarmos
+     * a regra referente aos turns ainda PENDING.
+     */
+    open suspend fun clearTurns(
+        sessionId: String,
+    ) {
+        sessionMemoryRepository.clearTurns(sessionId)
+
+        failOpen.failOpenWrite(
+            operation = "evictContextAfterClearTurns",
+        ) {
+            contextCacheRepository.evict(sessionId)
+        }
+    }
+
+    private fun buildConversationContext(
+        turns: List<ConversationTurn>,
+    ): String {
+        return turns.joinToString(separator = "\n\n") { turn ->
+            buildString {
+                append("Usuário: ")
+                append(turn.question)
+
+                turn.answer
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { answer ->
+                        append("\nAssistente: ")
+                        append(answer)
+                    }
+            }
+        }
+    }
 }
