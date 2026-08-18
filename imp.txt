@@ -6,50 +6,230 @@ open class MemoryService(
     private val failOpen: FailOpen,
 ) {
 
+    companion object {
+        private const val DEFAULT_CONTEXT_WINDOW = 20
+    }
+
     open suspend fun appendTurn(
         turn: ConversationTurn,
-        session: SessionMetadata,
-    )
+        metadata: SessionMetadata,
+    ) {
+        sessionMemoryRepository.appendTurn(
+            sessionId = metadata.sessionId,
+            turn = turn,
+        )
+
+        failOpen.failOpenWrite(
+            operation = "updateSessionIndex",
+        ) {
+            sessionIndexRepository.upsertSessionOnTurn(metadata)
+        }
+
+        failOpen.failOpenWrite(
+            operation = "invalidateContextCache",
+        ) {
+            contextCacheRepository.evict(metadata.sessionId)
+        }
+    }
 
     open suspend fun getConversationContext(
         sessionId: String,
-    ): String?
+    ): String? {
+        val cachedContext =
+            failOpen.failOpenRead(
+                operation = "getConversationContextCache",
+                default = null,
+            ) {
+                contextCacheRepository.get(sessionId)
+            }
+
+        if (!cachedContext.isNullOrBlank()) {
+            return cachedContext
+        }
+
+        val turns =
+            getRecentTurns(
+                sessionId = sessionId,
+                limit = DEFAULT_CONTEXT_WINDOW,
+            )
+
+        if (turns.isEmpty()) {
+            return null
+        }
+
+        val context = buildConversationContext(turns)
+
+        failOpen.failOpenWrite(
+            operation = "cacheConversationContext",
+        ) {
+            contextCacheRepository.put(
+                sessionId = sessionId,
+                value = context,
+            )
+        }
+
+        return context
+    }
+
+    open suspend fun getRecentTurns(
+        sessionId: String,
+        limit: Int = DEFAULT_CONTEXT_WINDOW,
+    ): List<ConversationTurn> {
+        return failOpen.failOpenRead(
+            operation = "getRecentTurns",
+            default = emptyList(),
+        ) {
+            sessionMemoryRepository.getRecentTurns(
+                sessionId = sessionId,
+                window = limit,
+            )
+        }
+    }
 
     open suspend fun listTurns(
         sessionId: String,
         page: Int,
         size: Int,
-        status: SessionStatus? = null,
-        appName: String? = null,
-        riskChatToken: String? = null,
-    ): PageResponse<ConversationTurn>
+    ): PageResponse<ConversationTurn> {
+        return failOpen.failOpenRead(
+            operation = "listTurns",
+            default = emptyTurnPage(
+                page = page,
+                size = size,
+            ),
+        ) {
+            sessionMemoryRepository.getTurns(
+                sessionId = sessionId,
+                page = page,
+                size = size,
+            )
+        }
+    }
 
     open suspend fun listSessions(
         userId: String,
         page: Int,
         size: Int,
-    ): PageResponse<SessionMetadata>
+    ): PageResponse<SessionMetadata> {
+        return failOpen.failOpenRead(
+            operation = "listSessions",
+            default = emptySessionPage(
+                page = page,
+                size = size,
+            ),
+        ) {
+            sessionIndexRepository.listByUser(
+                namUser = userId,
+                page = page,
+                size = size,
+            )
+        }
+    }
 
     open suspend fun findSession(
         sessionId: String,
-    ): SessionMetadata?
+    ): SessionMetadata? {
+        return failOpen.failOpenRead(
+            operation = "findSession",
+            default = null,
+        ) {
+            sessionIndexRepository.getSession(sessionId)
+        }
+    }
 
     open suspend fun findTurn(
         sessionId: String,
         chatHistoryId: String,
-    ): ConversationTurn?
+    ): ConversationTurn? {
+        return failOpen.failOpenRead(
+            operation = "findTurn",
+            default = null,
+        ) {
+            sessionMemoryRepository.findTurn(
+                sessionId = sessionId,
+                chatHistoryId = chatHistoryId,
+            )
+        }
+    }
 
     open suspend fun updateSessionStatus(
         sessionId: String,
         status: SessionStatus,
-    ): Boolean
+    ): Boolean {
+        return failOpen.failOpenWrite(
+            operation = "updateSessionStatus",
+            default = false,
+        ) {
+            sessionIndexRepository.updateStatus(
+                sessionId = sessionId,
+                status = status,
+            )
+        }
+    }
 
     open suspend fun resetConversationContext(
         sessionId: String,
         metadata: SessionMetadata,
-    )
-}
+    ) {
+        failOpen.failOpenWrite(
+            operation = "clearConversationTurns",
+        ) {
+            sessionMemoryRepository.clearTurns(sessionId)
+        }
 
+        failOpen.failOpenWrite(
+            operation = "updateSessionIndexAfterContextReset",
+        ) {
+            sessionIndexRepository.upsertSessionOnTurn(metadata)
+        }
+
+        failOpen.failOpenWrite(
+            operation = "evictConversationContextCache",
+        ) {
+            contextCacheRepository.evict(sessionId)
+        }
+    }
+
+    private fun buildConversationContext(
+        turns: List<ConversationTurn>,
+    ): String {
+        return turns.joinToString("\n\n") { turn ->
+            buildString {
+                appendLine("Usuário: ${turn.question}")
+
+                turn.answer
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let {
+                        append("Assistente: $it")
+                    }
+            }
+        }
+    }
+
+    private fun emptyTurnPage(
+        page: Int,
+        size: Int,
+    ): PageResponse<ConversationTurn> {
+        return PageResponse(
+            content = emptyList(),
+            total = 0,
+            page = page,
+            size = size,
+        )
+    }
+
+    private fun emptySessionPage(
+        page: Int,
+        size: Int,
+    ): PageResponse<SessionMetadata> {
+        return PageResponse(
+            content = emptyList(),
+            total = 0,
+            page = page,
+            size = size,
+        )
+    }
+}
 
 -----
 fun processQuestion(
