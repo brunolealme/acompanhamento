@@ -1,34 +1,342 @@
-@Component
-@ConditionalOnBean(MemoryService::class)
-open class RedisBackedConversationWindowSource(
+package pags.platform.risk_chat.risk_chat.service.chat
+
+import kotlinx.coroutines.reactor.awaitSingle
+import kotlinx.coroutines.reactor.awaitSingleOrNull
+import org.slf4j.LoggerFactory
+import org.springframework.data.domain.Sort
+import org.springframework.data.relational.core.query.Criteria
+import org.springframework.data.relational.core.query.Query
+import org.springframework.data.r2dbc.core.R2dbcEntityTemplate
+import org.springframework.http.HttpStatus
+import org.springframework.stereotype.Service
+import org.springframework.web.server.ResponseStatusException
+import java.time.LocalDateTime
+
+@Service
+open class ChatImplService(
+    private val template: R2dbcEntityTemplate,
+    private val sessionRepository: ChatSessionRepository,
+    private val chatHistoryRepository: ChatHistoryRepository,
     private val memoryService: MemoryService,
-) : ConversationWindowSource {
+) {
 
-    override suspend fun recentWindow(
-        sessionId: String,
-        maxMessages: Int,
-    ): List<MemoryTurn> {
-        require(maxMessages >= 0) {
-            "maxMessages must be greater than or equal to zero"
+    private val logger =
+        LoggerFactory.getLogger(ChatImplService::class.java)
+
+    open suspend fun listSessions(
+        namUser: String,
+        page: Int,
+        size: Int,
+        status: SessionStatus?,
+        appName: String?,
+    ): PageResponse<SessionSummaryResponse> {
+
+        logger.info(
+            "Listing user sessions: namUser={}, page={}, size={}, status={}, appName={}",
+            namUser,
+            page,
+            size,
+            status,
+            appName,
+        )
+
+        var criteria =
+            Criteria.where("namuser")
+                .`is`(namUser)
+
+        status?.let {
+            criteria =
+                criteria.and("flgstatus")
+                    .`is`(it)
         }
 
-        if (maxMessages == 0) {
-            return emptyList()
-        }
+        appName
+            ?.takeIf { it.isNotBlank() }
+            ?.let {
+                criteria =
+                    criteria.and("namsystem")
+                        .`is`(it)
+            }
 
-        return memoryService
-            .findRecentTurns(
-                sessionId = sessionId,
-                limit = maxMessages,
-            )
-            .map { turn ->
-                MemoryTurn(
-                    question = turn.question,
-                    answer = turn.answer,
-                    agentName = turn.agentName,
-                    category = turn.category,
-                    createdAt = turn.createdAt,
+        val query =
+            Query.query(criteria)
+                .sort(
+                    Sort.by(
+                        Sort.Direction.DESC,
+                        "datcreated",
+                    )
+                )
+                .limit(size)
+                .offset(page.toLong() * size)
+
+        val sessions =
+            template
+                .select(
+                    query,
+                    ChatSession::class.java,
+                )
+                .collectList()
+                .awaitSingle()
+
+        val total =
+            template
+                .count(
+                    Query.query(criteria),
+                    ChatSession::class.java,
+                )
+                .awaitSingle()
+
+        val content =
+            sessions.map { session ->
+
+                val messagesCount =
+                    chatHistoryRepository
+                        .countByIdtSession(
+                            session.idtSession,
+                        )
+                        .awaitSingle()
+
+                SessionSummaryResponse(
+                    sessionId = session.idtSession,
+                    namSession = session.namSession,
+                    status = session.flgStatus,
+                    system = session.namSystem,
+                    createdAt = session.datCreated,
+                    messagesCount = messagesCount,
                 )
             }
+
+        return PageResponse.of(
+            content = content,
+            total = total,
+            page = page,
+            size = size,
+        )
     }
+
+    open suspend fun getSession(
+        sessionId: String,
+        page: Int,
+        size: Int,
+        appName: String?,
+    ): ChatSessionResponse {
+
+        logger.info(
+            "Recovering session: sessionId={}, page={}, size={}, appName={}",
+            sessionId,
+            page,
+            size,
+            appName,
+        )
+
+        val session =
+            sessionRepository
+                .findById(sessionId)
+                .awaitSingleOrNull()
+                ?: throw ResponseStatusException(
+                    HttpStatus.NOT_FOUND,
+                    "Session not found: $sessionId",
+                )
+
+        /*
+         * Primeiro tentamos Redis.
+         *
+         * MemoryService já aplica o comportamento fail-open.
+         * Portanto, indisponibilidade/miss do Redis pode resultar
+         * em uma página vazia.
+         */
+        val redisHistory =
+            memoryService.listTurns(
+                sessionId = sessionId,
+                page = page,
+                size = size,
+            )
+
+        val messages: PageResponse<ChatHistoryItemResponse> =
+            if (redisHistory.content.isNotEmpty()) {
+
+                redisHistory.mapContent { turn ->
+                    ChatHistoryItemResponse(
+                        chatHistoryId = turn.chatHistoryId,
+                        question = turn.question,
+                        answer = turn.answer,
+                        feedback = turn.feedback,
+                        createdAt = turn.createdAt,
+                    )
+                }
+            } else {
+
+                /*
+                 * Redis não possui o histórico solicitado.
+                 *
+                 * Oracle é a fonte durável.
+                 */
+                findHistoryInOracle(
+                    sessionId = sessionId,
+                    page = page,
+                    size = size,
+                )
+            }
+
+        return ChatSessionResponse(
+            sessionId = session.idtSession,
+            status = session.flgStatus,
+            system = session.namSystem,
+            createdAt = session.datCreated,
+            messages = messages,
+        )
+    }
+
+    open suspend fun clearSessionContext(
+        sessionId: String,
+    ): ClearContextResponse {
+
+        logger.info(
+            "Clearing session context: sessionId={}",
+            sessionId,
+        )
+
+        /*
+         * Mantemos a validação porque o endpoint trabalha
+         * conceitualmente com uma sessão existente.
+         */
+        sessionRepository
+            .findById(sessionId)
+            .awaitSingleOrNull()
+            ?: throw ResponseStatusException(
+                HttpStatus.NOT_FOUND,
+                "Session not found: $sessionId",
+            )
+
+        /*
+         * Importante:
+         *
+         * isso remove somente:
+         *
+         * iara:context:{sessionId}
+         *
+         * Não remove memory/order e não altera o status
+         * da sessão no Oracle.
+         */
+        memoryService.evictConversationContext(
+            sessionId = sessionId,
+        )
+
+        return ClearContextResponse.success(
+            sessionId = sessionId,
+        )
+    }
+
+    open suspend fun registerFeedback(
+        request: FeedbackRequest,
+    ): FeedbackResponse {
+
+        logger.info(
+            "Registering feedback: chatHistoryId={}, positive={}",
+            request.chatHistoryId,
+            request.positive,
+        )
+
+        val chatHistory =
+            chatHistoryRepository
+                .findById(request.chatHistoryId)
+                .awaitSingleOrNull()
+                ?: throw ResponseStatusException(
+                    HttpStatus.NOT_FOUND,
+                    "Chat history not found: ${request.chatHistoryId}",
+                )
+
+        val updated =
+            chatHistory.copy(
+                flgFeedback =
+                    if (request.positive == true) {
+                        1
+                    } else {
+                        0
+                    },
+                desFeedback = request.comment,
+                datUpdated = LocalDateTime.now(),
+            )
+
+        chatHistoryRepository
+            .save(updated)
+            .awaitSingle()
+
+        return FeedbackResponse.success(
+            request.chatHistoryId,
+        )
+    }
+
+    private suspend fun findHistoryInOracle(
+        sessionId: String,
+        page: Int,
+        size: Int,
+    ): PageResponse<ChatHistoryItemResponse> {
+
+        val criteria =
+            Criteria.where("idtchatsession")
+                .`is`(sessionId)
+
+        val query =
+            Query.query(criteria)
+                .sort(
+                    Sort.by(
+                        Sort.Direction.ASC,
+                        "datcreated",
+                    )
+                )
+                .limit(size)
+                .offset(page.toLong() * size)
+
+        val history =
+            template
+                .select(
+                    query,
+                    ChatHistory::class.java,
+                )
+                .collectList()
+                .awaitSingle()
+
+        val total =
+            template
+                .count(
+                    Query.query(criteria),
+                    ChatHistory::class.java,
+                )
+                .awaitSingle()
+
+        val content =
+            history.map { chatHistory ->
+                chatHistory.toItemResponse()
+            }
+
+        return PageResponse.of(
+            content = content,
+            total = total,
+            page = page,
+            size = size,
+        )
+    }
+
+    private fun ChatHistory.toItemResponse(): ChatHistoryItemResponse =
+        ChatHistoryItemResponse(
+            chatHistoryId = idtChatHistory.toString(),
+            question = desUserInput.orEmpty(),
+            answer = desChatOutput,
+            feedback = flgFeedback?.let { it == 1 },
+            createdAt = datCreated,
+        )
+
+    private fun <T, R> PageResponse<T>.mapContent(
+        mapper: (T) -> R,
+    ): PageResponse<R> =
+        PageResponse(
+            content = content.map(mapper),
+            pageable = pageable,
+            totalElements = totalElements,
+            totalPages = totalPages,
+            first = first,
+            last = last,
+            empty = empty,
+        )
 }
