@@ -1,253 +1,34 @@
-@Service
-open class ChatService(
+@Component
+@ConditionalOnBean(MemoryService::class)
+open class RedisBackedConversationWindowSource(
     private val memoryService: MemoryService,
-) {
+) : ConversationWindowSource {
 
-    private val logger =
-        LoggerFactory.getLogger(ChatService::class.java)
-
-    open fun processQuestion(
-        request: ChatAskRequest,
-        appName: String?,
-        correlationId: String?,
-    ): Flow<ChatStreamEvent> = channelFlow {
-
-        val sessionId =
-            request.sessionId
-                ?: UUID.randomUUID().toString()
-
-        val chatHistoryId =
-            UUID.randomUUID().toString()
-
-        val conversationContext =
-            memoryService.getConversationContext(
-                sessionId = sessionId,
-            )
-
-        send(
-            ChatStreamEvent.metadata(
-                sessionId = sessionId,
-                chatHistoryId = chatHistoryId,
-            )
-        )
-
-        val completeResponse =
-            generateMockResponse(
-                question = request.question,
-                context = request.context,
-                previousContext = conversationContext,
-            )
-
-        val answerBuilder =
-            StringBuilder()
-
-        completeResponse
-            .chunked(CHUNK_SIZE)
-            .forEach { chunk ->
-
-                delay(CHUNK_DELAY_MILLIS)
-
-                answerBuilder.append(chunk)
-
-                send(
-                    ChatStreamEvent.message(
-                        content = chunk,
-                    )
-                )
-            }
-
-        val turn =
-            ConversationTurn(
-                sessionId = sessionId,
-                chatHistoryId = chatHistoryId,
-                userName = request.namUser,
-                systemName = appName ?: DEFAULT_SYSTEM,
-                question = request.question,
-                answer = answerBuilder.toString(),
-                persistStatus = PersistStatus.PENDING,
-                createdAt = LocalDateTime.now(),
-            )
-
-        memoryService.appendTurn(
-            turn = turn,
-            userId = request.namUser,
-        )
-
-        send(
-            ChatStreamEvent.complete(
-                sessionId = sessionId,
-                chatHistoryId = chatHistoryId,
-            )
-        )
-    }
-
-    open suspend fun listSessions(
-        namUser: String,
-        page: Int,
-        size: Int,
-    ): PageResponse<String> {
-        return memoryService.listSessionIds(
-            userId = namUser,
-            page = page,
-            size = size,
-        )
-    }
-
-    open suspend fun getSession(
+    override suspend fun recentWindow(
         sessionId: String,
-        page: Int,
-        size: Int,
-        appName: String?,
-    ): ChatSessionResponse {
+        maxMessages: Int,
+    ): List<MemoryTurn> {
+        require(maxMessages >= 0) {
+            "maxMessages must be greater than or equal to zero"
+        }
 
-        val chatHistory =
-            memoryService.listTurns(
+        if (maxMessages == 0) {
+            return emptyList()
+        }
+
+        return memoryService
+            .findRecentTurns(
                 sessionId = sessionId,
-                page = page,
-                size = size,
+                limit = maxMessages,
             )
-
-        val messages =
-            chatHistory.content.map { turn ->
-                ChatHistoryItemResponse(
-                    chatHistoryId = turn.chatHistoryId,
+            .map { turn ->
+                MemoryTurn(
                     question = turn.question,
                     answer = turn.answer,
-                    feedback = turn.feedback,
+                    agentName = turn.agentName,
+                    category = turn.category,
                     createdAt = turn.createdAt,
                 )
             }
-
-        return ChatSessionResponse(
-            sessionId = sessionId,
-            system = appName ?: DEFAULT_SYSTEM,
-            messages =
-                PageResponse(
-                    content = messages,
-                    pageable = chatHistory.pageable,
-                    totalElements = chatHistory.totalElements,
-                    totalPages = chatHistory.totalPages,
-                    first = chatHistory.first,
-                    last = chatHistory.last,
-                    empty = chatHistory.empty,
-                ),
-        )
-    }
-
-    open suspend fun clearSessionContext(
-        sessionId: String,
-    ): ClearContextResponse {
-
-        memoryService.evictConversationContext(
-            sessionId = sessionId,
-        )
-
-        logger.info(
-            "Cleaning session context: sessionId={}",
-            sessionId,
-        )
-
-        return ClearContextResponse.success(
-            sessionId = sessionId,
-        )
-    }
-
-    open suspend fun registerFeedback(
-        request: FeedbackRequest,
-        appName: String?,
-        correlationId: String?,
-    ): FeedbackResponse {
-
-        logger.info(
-            "Registering feedback: chatHistoryId={}, positive={}",
-            request.chatHistoryId,
-            request.positive,
-        )
-
-        /*
-         * Aqui ainda precisamos revisar a implementação real
-         * de feedback.
-         *
-         * Não colocaria mock novo.
-         */
-        return FeedbackResponse.success(
-            request.chatHistoryId,
-        )
-    }
-
-    private fun generateMockResponse(
-        question: String,
-        context: Map<String, String>?,
-        previousContext: String?,
-    ): String {
-        /*
-         * Único ponto mockado.
-         */
-        val normalizedQuestion =
-            question.trim().lowercase()
-
-        return when {
-            normalizedQuestion.contains("dossiê") ||
-                normalizedQuestion.contains("dossie") -> {
-
-                """
-                Com base na análise do dossiê:
-
-                1. Status: Em análise
-                2. Alertas: 3 alertas de movimentação atípica
-                3. Valor total: R$ 523.450,00
-                """.trimIndent()
-            }
-
-            normalizedQuestion.contains("alerta") -> {
-
-                """
-                O alerta foi gerado devido à detecção de padrões transacionais atípicos:
-
-                - Aumento de 340% no volume
-                - Fracionamento de valores
-                - Transações em horários atípicos
-                """.trimIndent()
-            }
-
-            normalizedQuestion.contains("transação") ||
-                normalizedQuestion.contains("pix") -> {
-
-                """
-                Transações do período:
-
-                - Total: 47 transações
-                - Valor: R$ 892.150,00
-                - Maior: R$ 154.357,00 (PIX)
-                """.trimIndent()
-            }
-
-            else -> {
-                buildString {
-                    previousContext
-                        ?.takeIf { it.isNotBlank() }
-                        ?.let {
-                            appendLine("Contexto anterior considerado.")
-                            appendLine()
-                        }
-
-                    append(
-                        "Consulta processada. Para informações específicas sobre " +
-                            "dossiês, alertas ou transações, forneça mais detalhes."
-                    )
-                }
-            }
-        }
-    }
-
-    companion object {
-        private const val DEFAULT_SYSTEM =
-            "gerenciador-pld-panel"
-
-        private const val CHUNK_SIZE =
-            20
-
-        private const val CHUNK_DELAY_MILLIS =
-            100L
     }
 }
