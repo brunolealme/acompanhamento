@@ -263,3 +263,57 @@ override suspend fun findBySessionIds(
         .collectList()
         .awaitSingle()
 }
+
+
+####
+open suspend fun listSessions(
+    userId: String,
+    page: Int,
+    size: Int,
+): PageResponse<SessionSummaryResponse> {
+
+    val sessionIdsPage =
+        memoryService.listSessionIds(
+            userId = userId,
+            page = page,
+            size = size,
+        )
+
+    if (sessionIdsPage.content.isEmpty()) {
+        return listSessionsFromOracle(
+            userId = userId,
+            page = page,
+            size = size,
+        )
+    }
+
+    val sessions =
+        sessionIdsPage.content.mapNotNull { sessionId ->
+            memoryService
+                .findSessionMetadata(sessionId)
+                ?.toSessionSummaryResponse()
+        }
+
+    /*
+     * Se o índice Redis possui sessões, mas alguma metadata
+     * não está disponível, não retornamos uma página parcial.
+     *
+     * Fazemos fallback para a fonte durável.
+     */
+    if (sessions.size != sessionIdsPage.content.size) {
+        return listSessionsFromOracle(
+            userId = userId,
+            page = page,
+            size = size,
+        )
+    }
+
+    return PageResponse.of(
+        content = sessions,
+        total = sessionIdsPage.total,
+        page = page,
+        size = size,
+    )
+}
+
+
