@@ -1,707 +1,110 @@
-interface SessionMemoryRepository {
-
-    suspend fun appendTurn(
-        sessionId: String,
-        turn: ConversationTurn,
-    )
-
-    suspend fun listTurns(
-        sessionId: String,
-        page: Int,
-        size: Int,
-    ): PageResponse<ConversationTurn>
-
-    suspend fun findRecentTurns(
-        sessionId: String,
-        limit: Int? = null,
-    ): List<ConversationTurn>
-
-    suspend fun countTurns(
-        sessionId: String,
-    ): Long
-
-    suspend fun findTurn(
-        sessionId: String,
-        chatHistoryId: String,
-    ): ConversationTurn?
-
-    suspend fun updateTurnPersistenceStatus(
-        sessionId: String,
-        chatHistoryId: String,
-        persistStatus: PersistStatus,
-    ): Boolean
-
-    suspend fun addPendingTurn(
-        sessionId: String,
-        chatHistoryId: String,
-    )
-
-    suspend fun findPendingTurns(
-        limit: Long,
-    ): List<PendingTurnReference>
-
-    suspend fun removePendingTurn(
-        chatHistoryId: String,
-    )
-
-    suspend fun clearTurns(
-        sessionId: String,
-    )
-}
-
-data class PendingTurnReference(
-    val sessionId: String,
-    val chatHistoryId: String,
-)
-
-
----/---------
-
 @Repository
-open class RedisSessionMemoryRepository(
+open class RedisContextCacheRepository(
     private val redisTemplate: ReactiveStringRedisTemplate,
     private val properties: IaraMemoryProperties,
-    private val serializer: MemoryJsonSerializer,
-) : SessionMemoryRepository {
+) : ContextCacheRepository {
 
-    private val logger =
-        LoggerFactory.getLogger(RedisSessionMemoryRepository::class.java)
-
-    override suspend fun appendTurn(
+    override suspend fun save(
         sessionId: String,
-        turn: ConversationTurn,
+        context: String,
     ) {
-        validateIdentifiers(
-            sessionId = sessionId,
-            chatHistoryId = turn.chatHistoryId,
-        )
+        validateSessionId(sessionId)
 
-        require(turn.persistStatus == PersistStatus.PENDING) {
-            "persistStatus must start as PENDING"
-        }
-
-        val memoryKey =
-            CacheConstants.memoryKey(
+        val key =
+            CacheConstants.contextKey(
                 properties.keyPrefix,
                 sessionId,
-            )
-
-        val orderKey =
-            CacheConstants.memoryOrderKey(
-                properties.keyPrefix,
-                sessionId,
-            )
-
-        val persistedTurn =
-            turn.copy(
-                sessionId = sessionId,
-                persistStatus = PersistStatus.PENDING,
-                schemaVersion = ConversationTurn.CURRENT_SCHEMA_VERSION,
-            )
-
-        val payload =
-            serializer.serializeConversationTurn(persistedTurn)
-
-        // iara:memory:{sessionId}
-        // HASH:
-        // chatHistoryId -> JSON do turno
-        redisTemplate
-            .opsForHash<String, String>()
-            .put(
-                memoryKey,
-                turn.chatHistoryId,
-                payload,
-            )
-            .awaitSingle()
-
-        // iara:order:{sessionId}
-        // SORTED SET:
-        // score -> momento do append
-        // member -> chatHistoryId
-        redisTemplate
-            .opsForZSet()
-            .add(
-                orderKey,
-                turn.chatHistoryId,
-                Instant.now().toEpochMilli().toDouble(),
-            )
-            .awaitSingle()
-
-        renewSessionTtl(
-            memoryKey = memoryKey,
-            orderKey = orderKey,
-        )
-    }
-
-    override suspend fun listTurns(
-        sessionId: String,
-        page: Int,
-        size: Int,
-    ): PageResponse<ConversationTurn> {
-
-        val normalizedPage =
-            PageUtil.normalizePage(page)
-
-        val normalizedSize =
-            PageUtil.normalizeSizeCoerceIn(
-                size,
-                properties.maxPageSize,
-            )
-
-        val totalElements =
-            countTurns(sessionId)
-
-        if (totalElements == 0L) {
-            return PageResponse.of(
-                content = emptyList(),
-                total = 0,
-                page = normalizedPage,
-                size = normalizedSize,
-            )
-        }
-
-        val orderKey =
-            CacheConstants.memoryOrderKey(
-                properties.keyPrefix,
-                sessionId,
-            )
-
-        val memoryKey =
-            CacheConstants.memoryKey(
-                properties.keyPrefix,
-                sessionId,
-            )
-
-        val start =
-            normalizedPage.toLong() * normalizedSize.toLong()
-
-        val end =
-            start + normalizedSize.toLong() - 1
-
-        val turnIds =
-            redisTemplate
-                .opsForZSet()
-                .range(
-                    orderKey,
-                    Range.closed(start, end),
-                )
-                .collectList()
-                .awaitSingle()
-
-        if (turnIds.isEmpty()) {
-            return PageResponse.of(
-                content = emptyList(),
-                total = totalElements,
-                page = normalizedPage,
-                size = normalizedSize,
-            )
-        }
-
-        val payloads =
-            redisTemplate
-                .opsForHash<String, String>()
-                .multiGet(
-                    memoryKey,
-                    turnIds,
-                )
-                .awaitSingle()
-
-        val turns =
-            payloads
-                .mapNotNull { payload ->
-                    payload?.let(serializer::deserializeConversationTurn)
-                }
-
-        return PageResponse.of(
-            content = turns,
-            total = totalElements,
-            page = normalizedPage,
-            size = normalizedSize,
-        )
-    }
-
-    override suspend fun findRecentTurns(
-        sessionId: String,
-        limit: Int?,
-    ): List<ConversationTurn> {
-
-        val configuredLimit =
-            properties.context.maxTurns
-                .coerceAtLeast(1)
-
-        val normalizedLimit =
-            (limit ?: configuredLimit)
-                .coerceIn(
-                    minimumValue = 1,
-                    maximumValue = configuredLimit,
-                )
-
-        /*
-         * Busca um pouco mais para tolerar eventual referência
-         * existente no order cujo payload já não esteja disponível.
-         */
-        val fetchSize =
-            (normalizedLimit * 2)
-                .coerceAtMost(configuredLimit * 2)
-
-        val orderKey =
-            CacheConstants.memoryOrderKey(
-                properties.keyPrefix,
-                sessionId,
-            )
-
-        val memoryKey =
-            CacheConstants.memoryKey(
-                properties.keyPrefix,
-                sessionId,
-            )
-
-        val turnIds =
-            redisTemplate
-                .opsForZSet()
-                .reverseRange(
-                    orderKey,
-                    Range.closed(
-                        0L,
-                        fetchSize.toLong() - 1,
-                    ),
-                )
-                .collectList()
-                .awaitSingle()
-
-        if (turnIds.isEmpty()) {
-            return emptyList()
-        }
-
-        val payloads =
-            redisTemplate
-                .opsForHash<String, String>()
-                .multiGet(
-                    memoryKey,
-                    turnIds,
-                )
-                .awaitSingle()
-
-        /*
-         * reverseRange trouxe:
-         *
-         * mais novo -> mais antigo
-         *
-         * Para montar contexto conversacional queremos:
-         *
-         * mais antigo -> mais novo
-         */
-        return payloads
-            .mapNotNull { payload ->
-                payload?.let(serializer::deserializeConversationTurn)
-            }
-            .take(normalizedLimit)
-            .reversed()
-    }
-
-    override suspend fun countTurns(
-        sessionId: String,
-    ): Long {
-
-        val orderKey =
-            CacheConstants.memoryOrderKey(
-                properties.keyPrefix,
-                sessionId,
-            )
-
-        return redisTemplate
-            .opsForZSet()
-            .size(orderKey)
-            .awaitSingle()
-    }
-
-    override suspend fun findTurn(
-        sessionId: String,
-        chatHistoryId: String,
-    ): ConversationTurn? {
-
-        validateIdentifiers(
-            sessionId = sessionId,
-            chatHistoryId = chatHistoryId,
-        )
-
-        val memoryKey =
-            CacheConstants.memoryKey(
-                properties.keyPrefix,
-                sessionId,
-            )
-
-        val payload =
-            redisTemplate
-                .opsForHash<String, String>()
-                .get(
-                    memoryKey,
-                    chatHistoryId,
-                )
-                .awaitFirstOrNull()
-                ?: return null
-
-        return serializer
-            .deserializeConversationTurn(payload)
-    }
-
-    override suspend fun updateTurnPersistenceStatus(
-        sessionId: String,
-        chatHistoryId: String,
-        persistStatus: PersistStatus,
-    ): Boolean {
-
-        val currentTurn =
-            findTurn(
-                sessionId = sessionId,
-                chatHistoryId = chatHistoryId,
-            ) ?: return false
-
-        val memoryKey =
-            CacheConstants.memoryKey(
-                properties.keyPrefix,
-                sessionId,
-            )
-
-        val updatedTurn =
-            currentTurn.copy(
-                persistStatus = persistStatus,
             )
 
         redisTemplate
             .opsForHash<String, String>()
             .put(
-                memoryKey,
-                chatHistoryId,
-                serializer.serializeConversationTurn(updatedTurn),
+                key,
+                CONTEXT_FIELD,
+                context,
             )
             .awaitSingle()
 
-        if (persistStatus == PersistStatus.PERSISTED) {
-            removePendingTurn(chatHistoryId)
-        }
-
-        return true
-    }
-
-    override suspend fun addPendingTurn(
-        sessionId: String,
-        chatHistoryId: String,
-    ) {
-        validateIdentifiers(
-            sessionId = sessionId,
-            chatHistoryId = chatHistoryId,
-        )
-
-        val pendingKey =
-            CacheConstants.pendingIndexKey(
-                properties.keyPrefix,
-            )
-
-        /*
-         * iara:pending
-         *
-         * HASH
-         *
-         * field = chatHistoryId
-         * value = sessionId
-         */
-        redisTemplate
-            .opsForHash<String, String>()
-            .put(
-                pendingKey,
-                chatHistoryId,
-                sessionId,
-            )
-            .awaitSingle()
-
-        /*
-         * A especificação diz TTL >= 21 dias.
-         * Se existir uma propriedade específica para pending,
-         * devemos usá-la aqui.
-         */
         redisTemplate
             .expire(
-                pendingKey,
-                properties.sessionTtl,
+                key,
+                properties.contextCache.ttl,
             )
             .awaitSingle()
     }
 
-    override suspend fun findPendingTurns(
-        limit: Long,
-    ): List<PendingTurnReference> {
+    override suspend fun find(
+        sessionId: String,
+    ): String? {
+        validateSessionId(sessionId)
 
-        require(limit > 0) {
-            "limit must be greater than zero"
-        }
-
-        val pendingKey =
-            CacheConstants.pendingIndexKey(
+        val key =
+            CacheConstants.contextKey(
                 properties.keyPrefix,
+                sessionId,
             )
-
-        val scanOptions =
-            ScanOptions
-                .scanOptions()
-                .count(limit)
-                .build()
 
         return redisTemplate
             .opsForHash<String, String>()
-            .scan(
-                pendingKey,
-                scanOptions,
+            .get(
+                key,
+                CONTEXT_FIELD,
             )
-            .take(limit)
-            .map { entry ->
-                PendingTurnReference(
-                    chatHistoryId = entry.key,
-                    sessionId = entry.value,
-                )
-            }
-            .collectList()
-            .awaitSingle()
+            .awaitFirstOrNull()
     }
 
-    override suspend fun removePendingTurn(
-        chatHistoryId: String,
+    override suspend fun evict(
+        sessionId: String,
     ) {
-        require(
-            chatHistoryId.length <= MAX_IDENTIFIER_LENGTH
-        ) {
-            "chatHistoryId must have at most $MAX_IDENTIFIER_LENGTH characters"
-        }
+        validateSessionId(sessionId)
 
-        val pendingKey =
-            CacheConstants.pendingIndexKey(
+        val key =
+            CacheConstants.contextKey(
                 properties.keyPrefix,
+                sessionId,
             )
 
         redisTemplate
-            .opsForHash<String, String>()
-            .remove(
-                pendingKey,
-                chatHistoryId,
-            )
+            .delete(key)
             .awaitSingle()
     }
 
-    override suspend fun clearTurns(
+    private fun validateSessionId(
         sessionId: String,
     ) {
         require(
             sessionId.length <= MAX_IDENTIFIER_LENGTH
         ) {
             "sessionId must have at most $MAX_IDENTIFIER_LENGTH characters"
-        }
-
-        val memoryKey =
-            CacheConstants.memoryKey(
-                properties.keyPrefix,
-                sessionId,
-            )
-
-        val orderKey =
-            CacheConstants.memoryOrderKey(
-                properties.keyPrefix,
-                sessionId,
-            )
-
-        redisTemplate
-            .delete(
-                listOf(
-                    memoryKey,
-                    orderKey,
-                )
-            )
-            .awaitSingle()
-    }
-
-    private suspend fun renewSessionTtl(
-        memoryKey: String,
-        orderKey: String,
-    ) {
-        redisTemplate
-            .expire(
-                memoryKey,
-                properties.sessionTtl,
-            )
-            .awaitSingle()
-
-        redisTemplate
-            .expire(
-                orderKey,
-                properties.sessionTtl,
-            )
-            .awaitSingle()
-    }
-
-    private fun validateIdentifiers(
-        sessionId: String,
-        chatHistoryId: String,
-    ) {
-        require(
-            sessionId.length <= MAX_IDENTIFIER_LENGTH
-        ) {
-            "sessionId must have at most $MAX_IDENTIFIER_LENGTH characters"
-        }
-
-        require(
-            chatHistoryId.length <= MAX_IDENTIFIER_LENGTH
-        ) {
-            "chatHistoryId must have at most $MAX_IDENTIFIER_LENGTH characters"
         }
     }
 
     companion object {
+        private const val CONTEXT_FIELD = "context"
         private const val MAX_IDENTIFIER_LENGTH = 40
     }
 }
+-----
+
+import kotlinx.coroutines.reactor.awaitSingle
+import kotlinx.coroutines.reactor.awaitFirstOrNull
+import org.springframework.data.redis.core.ReactiveStringRedisTemplate
+import org.springframework.stereotype.Repository
 
 
--------
+-----
+interface ContextCacheRepository {
 
-@Service
-open class MemoryService(
-    private val sessionMemoryRepository: SessionMemoryRepository,
-    private val sessionIndexRepository: SessionIndexRepository,
-    private val contextCacheRepository: ContextCacheRepository,
-    private val failOpen: FailOpen,
-) {
-
-    open suspend fun appendTurn(
-        turn: ConversationTurn,
-        metadata: SessionMetadata,
-    ) {
-        /*
-         * Obrigatório.
-         *
-         * Grava:
-         * - iara:memory:{sessionId}
-         * - iara:order:{sessionId}
-         */
-        sessionMemoryRepository.appendTurn(
-            sessionId = metadata.sessionId,
-            turn = turn,
-        )
-
-        /*
-         * Obrigatório.
-         *
-         * Sem isso o turno nunca chega ao reconciliador/Oracle.
-         */
-        sessionMemoryRepository.addPendingTurn(
-            sessionId = metadata.sessionId,
-            chatHistoryId = turn.chatHistoryId,
-        )
-
-        /*
-         * Mantive o contrato existente porque ainda não analisamos
-         * SessionIndexRepository.
-         */
-        failOpen.failOpenWrite(
-            operation = "updateUserSessionIndex",
-        ) {
-            sessionIndexRepository.upsertSessionOnTurn(metadata)
-        }
-
-        /*
-         * Cache é otimização: pode ser fail-open.
-         */
-        failOpen.failOpenWrite(
-            operation = "invalidateContextCache",
-        ) {
-            contextCacheRepository.evict(
-                metadata.sessionId,
-            )
-        }
-    }
-
-    open suspend fun getRecentTurns(
+    suspend fun save(
         sessionId: String,
-        limit: Int? = null,
-    ): List<ConversationTurn> {
+        context: String,
+    )
 
-        return failOpen.failOpenRead(
-            operation = "getRecentTurns",
-            default = emptyList(),
-        ) {
-            sessionMemoryRepository.findRecentTurns(
-                sessionId = sessionId,
-                limit = limit,
-            )
-        }
-    }
-
-    open suspend fun listTurns(
+    suspend fun find(
         sessionId: String,
-        page: Int,
-        size: Int,
-    ): PageResponse<ConversationTurn> {
+    ): String?
 
-        return failOpen.failOpenRead(
-            operation = "listTurns",
-            default = PageResponse.of(
-                content = emptyList(),
-                total = 0,
-                page = page,
-                size = size,
-            ),
-        ) {
-            sessionMemoryRepository.listTurns(
-                sessionId = sessionId,
-                page = page,
-                size = size,
-            )
-        }
-    }
-
-    open suspend fun findTurn(
+    suspend fun evict(
         sessionId: String,
-        chatHistoryId: String,
-    ): ConversationTurn? {
-
-        return failOpen.failOpenRead(
-            operation = "findTurn",
-            default = null,
-        ) {
-            sessionMemoryRepository.findTurn(
-                sessionId = sessionId,
-                chatHistoryId = chatHistoryId,
-            )
-        }
-    }
-
-    open suspend fun updateTurnPersistenceStatus(
-        sessionId: String,
-        chatHistoryId: String,
-        persistStatus: PersistStatus,
-    ): Boolean {
-
-        return sessionMemoryRepository
-            .updateTurnPersistenceStatus(
-                sessionId = sessionId,
-                chatHistoryId = chatHistoryId,
-                persistStatus = persistStatus,
-            )
-    }
-
-    open suspend fun findPendingTurns(
-        limit: Long,
-    ): List<PendingTurnReference> {
-
-        return sessionMemoryRepository
-            .findPendingTurns(limit)
-    }
-
-    /*
-     * Eu não colocaria clearTurns aqui como "clearContext".
-     *
-     * clearTurns realmente apaga memory + order.
-     * Vamos decidir o uso dele quando revisarmos a semântica
-     * do endpoint DELETE /sessions/{sessionId}/context.
-     */
+    )
 }
-
-
