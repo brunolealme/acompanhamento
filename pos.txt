@@ -1,0 +1,510 @@
+@Service
+open class ChatImplService(
+    private val template: R2dbcEntityTemplate,
+    private val sessionRepository: ChatSessionRepository,
+    private val chatHistoryRepository: ChatHistoryRepository,
+    private val memoryService: MemoryService,
+) {
+
+    private val logger =
+        LoggerFactory.getLogger(ChatImplService::class.java)
+
+    open suspend fun listSessions(
+        namUser: String,
+        page: Int,
+        size: Int,
+        status: SessionStatus?,
+        appName: String?,
+    ): PageResponse<SessionSummaryResponse> {
+
+        logger.info(
+            "Listing user sessions: namUser={}, page={}, size={}, status={}, appName={}",
+            namUser,
+            page,
+            size,
+            status,
+            appName,
+        )
+
+        /*
+         * iara:sessions:{userId} não possui status.
+         *
+         * Se existe filtro por status, não podemos:
+         *
+         * 1. paginar Redis
+         * 2. buscar metadata
+         * 3. filtrar status
+         *
+         * pois isso quebraria a paginação.
+         *
+         * Nesse cenário Oracle é a fonte adequada.
+         */
+        if (status != null) {
+            return listSessionsFromOracle(
+                namUser = namUser,
+                page = page,
+                size = size,
+                status = status,
+            )
+        }
+
+        /*
+         * Fluxo normal:
+         *
+         * iara:sessions:{userId}
+         *          ↓
+         * sessionIds
+         *          ↓
+         * Oracle apenas para enriquecer metadata
+         */
+        val sessionIdsPage =
+            memoryService.listSessionIds(
+                userId = namUser,
+                page = page,
+                size = size,
+            )
+
+        /*
+         * MemoryService é fail-open.
+         *
+         * Página vazia pode significar:
+         * - usuário sem sessões no Redis;
+         * - TTL expirado;
+         * - indisponibilidade do Redis.
+         *
+         * Oracle é o fallback durável.
+         */
+        if (sessionIdsPage.content.isEmpty()) {
+            return listSessionsFromOracle(
+                namUser = namUser,
+                page = page,
+                size = size,
+                status = null,
+            )
+        }
+
+        val sessions =
+            findSessionsByIds(
+                namUser = namUser,
+                sessionIds = sessionIdsPage.content,
+            )
+
+        /*
+         * Pode acontecer de o índice Redis possuir uma sessão ainda
+         * não disponível no Oracle, ou existir alguma inconsistência.
+         *
+         * Como SessionSummaryResponse exige metadata que não existe
+         * no índice Redis, não inventamos os dados.
+         */
+        if (sessions.size != sessionIdsPage.content.size) {
+            logger.warn(
+                "Session index and durable metadata differ. Falling back to Oracle: namUser={}",
+                namUser,
+            )
+
+            return listSessionsFromOracle(
+                namUser = namUser,
+                page = page,
+                size = size,
+                status = null,
+            )
+        }
+
+        val sessionsById =
+            sessions.associateBy { it.idtSession }
+
+        /*
+         * Preserva a ordem fornecida pelo ZSET:
+         * score = último acesso.
+         */
+        val orderedSessions =
+            sessionIdsPage.content
+                .mapNotNull(sessionsById::get)
+
+        val content =
+            orderedSessions.map { session ->
+                session.toSummaryResponse()
+            }
+
+        return PageResponse(
+            content = content,
+            pageable =
+                PageableInfo(
+                    pageNumber = page,
+                    pageSize = size,
+                ),
+            totalElements = sessionIdsPage.totalElements,
+            totalPages = sessionIdsPage.totalPages,
+            first = sessionIdsPage.first,
+            last = sessionIdsPage.last,
+            empty = content.isEmpty(),
+        )
+    }
+
+    open suspend fun getSession(
+        sessionId: String,
+        page: Int,
+        size: Int,
+        appName: String?,
+    ): ChatSessionResponse {
+
+        logger.info(
+            "Recovering session: sessionId={}, page={}, size={}, appName={}",
+            sessionId,
+            page,
+            size,
+            appName,
+        )
+
+        /*
+         * HISTÓRICO:
+         *
+         * Redis primeiro.
+         */
+        val redisHistory =
+            memoryService.listTurns(
+                sessionId = sessionId,
+                page = page,
+                size = size,
+            )
+
+        val messages =
+            if (redisHistory.content.isNotEmpty()) {
+                redisHistory.toHistoryResponse()
+            } else {
+                /*
+                 * Redis miss / TTL / indisponibilidade:
+                 * consulta fonte durável.
+                 */
+                findHistoryInOracle(
+                    sessionId = sessionId,
+                    page = page,
+                    size = size,
+                )
+            }
+
+        /*
+         * METADATA:
+         *
+         * Não existe mais iara:session:{sessionId}.
+         *
+         * Portanto status/system/createdAt precisam vir
+         * da fonte real: CHAT_SESSION.
+         *
+         * Essa consulta não é pré-condição para consultar Redis;
+         * ela existe apenas para completar ChatSessionResponse.
+         */
+        val session =
+            sessionRepository
+                .findById(sessionId)
+                .awaitSingleOrNull()
+                ?: throw ResponseStatusException(
+                    HttpStatus.NOT_FOUND,
+                    "Session not found: $sessionId",
+                )
+
+        return ChatSessionResponse(
+            sessionId = session.idtSession,
+            status = session.flgStatus,
+            system = session.namSystem,
+            createdAt = session.datCreated,
+            messages = messages,
+        )
+    }
+
+    open suspend fun clearSessionContext(
+        sessionId: String,
+    ): ClearContextResponse {
+
+        logger.info(
+            "Clearing session context: sessionId={}",
+            sessionId,
+        )
+
+        /*
+         * Não consulta Oracle.
+         *
+         * A responsabilidade deste endpoint é remover:
+         *
+         * iara:context:{sessionId}
+         *
+         * DEL de uma chave inexistente também é semanticamente
+         * aceitável para esta operação.
+         */
+        memoryService.evictConversationContext(
+            sessionId = sessionId,
+        )
+
+        return ClearContextResponse.success(
+            sessionId = sessionId,
+        )
+    }
+
+    open suspend fun registerFeedback(
+        request: FeedbackRequest,
+    ): FeedbackResponse {
+
+        logger.info(
+            "Registering feedback: chatHistoryId={}, positive={}",
+            request.chatHistoryId,
+            request.positive,
+        )
+
+        /*
+         * Feedback pertence ao histórico durável.
+         *
+         * Não existe hoje contrato Redis para alterar feedback
+         * de ConversationTurn, portanto não inventamos essa escrita.
+         */
+        val chatHistory =
+            chatHistoryRepository
+                .findById(request.chatHistoryId)
+                .awaitSingleOrNull()
+                ?: throw ResponseStatusException(
+                    HttpStatus.NOT_FOUND,
+                    "Chat history not found: ${request.chatHistoryId}",
+                )
+
+        val updated =
+            chatHistory.copy(
+                flgFeedback =
+                    if (request.positive == true) {
+                        1
+                    } else {
+                        0
+                    },
+                desFeedback = request.comment,
+                datUpdated = LocalDateTime.now(),
+            )
+
+        chatHistoryRepository
+            .save(updated)
+            .awaitSingle()
+
+        return FeedbackResponse.success(
+            request.chatHistoryId,
+        )
+    }
+
+    private suspend fun listSessionsFromOracle(
+        namUser: String,
+        page: Int,
+        size: Int,
+        status: SessionStatus?,
+    ): PageResponse<SessionSummaryResponse> {
+
+        var criteria =
+            Criteria
+                .where("namuser")
+                .`is`(namUser)
+
+        status?.let {
+            criteria =
+                criteria
+                    .and("flgstatus")
+                    .`is`(it)
+        }
+
+        val query =
+            Query
+                .query(criteria)
+                .sort(
+                    Sort.by(
+                        Sort.Direction.DESC,
+                        "datcreated",
+                    )
+                )
+                .limit(size)
+                .offset(page.toLong() * size)
+
+        val sessions =
+            template
+                .select(
+                    query,
+                    ChatSession::class.java,
+                )
+                .collectList()
+                .awaitSingle()
+
+        val total =
+            template
+                .count(
+                    Query.query(criteria),
+                    ChatSession::class.java,
+                )
+                .awaitSingle()
+
+        val content =
+            sessions.map { session ->
+                session.toSummaryResponse()
+            }
+
+        return pageResponseOf(
+            content = content,
+            total = total,
+            page = page,
+            size = size,
+        )
+    }
+
+    private suspend fun findSessionsByIds(
+        namUser: String,
+        sessionIds: List<String>,
+    ): List<ChatSession> {
+
+        if (sessionIds.isEmpty()) {
+            return emptyList()
+        }
+
+        val criteria =
+            Criteria
+                .where("namuser")
+                .`is`(namUser)
+                .and("idtsession")
+                .`in`(sessionIds)
+
+        return template
+            .select(
+                Query.query(criteria),
+                ChatSession::class.java,
+            )
+            .collectList()
+            .awaitSingle()
+    }
+
+    private suspend fun findHistoryInOracle(
+        sessionId: String,
+        page: Int,
+        size: Int,
+    ): PageResponse<ChatHistoryItemResponse> {
+
+        val criteria =
+            Criteria
+                .where("idtchatsession")
+                .`is`(sessionId)
+
+        val query =
+            Query
+                .query(criteria)
+                .sort(
+                    Sort.by(
+                        Sort.Direction.ASC,
+                        "datcreated",
+                    )
+                )
+                .limit(size)
+                .offset(page.toLong() * size)
+
+        val history =
+            template
+                .select(
+                    query,
+                    ChatHistory::class.java,
+                )
+                .collectList()
+                .awaitSingle()
+
+        val total =
+            template
+                .count(
+                    Query.query(criteria),
+                    ChatHistory::class.java,
+                )
+                .awaitSingle()
+
+        val content =
+            history.map { item ->
+                item.toHistoryItemResponse()
+            }
+
+        return pageResponseOf(
+            content = content,
+            total = total,
+            page = page,
+            size = size,
+        )
+    }
+
+    private suspend fun ChatSession.toSummaryResponse():
+        SessionSummaryResponse {
+
+        val messagesCount =
+            chatHistoryRepository
+                .countByIdtSession(idtSession)
+                .awaitSingle()
+
+        return SessionSummaryResponse(
+            sessionId = idtSession,
+            namSession = namSession,
+            status = flgStatus,
+            system = namSystem,
+            createdAt = datCreated,
+            messagesCount = messagesCount,
+        )
+    }
+
+    private fun ChatHistory.toHistoryItemResponse():
+        ChatHistoryItemResponse =
+        ChatHistoryItemResponse(
+            chatHistoryId = idtChatHistory.toString(),
+            question = desUserInput.orEmpty(),
+            answer = desChatOutput,
+            feedback =
+                flgFeedback?.let { value ->
+                    value == 1
+                },
+            createdAt = datCreated,
+        )
+
+    private fun PageResponse<ConversationTurn>.toHistoryResponse():
+        PageResponse<ChatHistoryItemResponse> =
+        PageResponse(
+            content =
+                content.map { turn ->
+                    ChatHistoryItemResponse(
+                        chatHistoryId = turn.chatHistoryId,
+                        question = turn.question,
+                        answer = turn.answer,
+                        feedback = turn.feedback,
+                        createdAt = turn.createdAt,
+                    )
+                },
+            pageable = pageable,
+            totalElements = totalElements,
+            totalPages = totalPages,
+            first = first,
+            last = last,
+            empty = empty,
+        )
+
+    private fun <T> pageResponseOf(
+        content: List<T>,
+        total: Long,
+        page: Int,
+        size: Int,
+    ): PageResponse<T> {
+
+        val totalPages =
+            if (total == 0L) {
+                0
+            } else {
+                ((total + size - 1) / size).toInt()
+            }
+
+        return PageResponse(
+            content = content,
+            pageable =
+                PageableInfo(
+                    pageNumber = page,
+                    pageSize = size,
+                ),
+            totalElements = total,
+            totalPages = totalPages,
+            first = page == 0,
+            last =
+                totalPages == 0 ||
+                    page >= totalPages - 1,
+            empty = content.isEmpty(),
+        )
+    }
+}
