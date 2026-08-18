@@ -1,0 +1,105 @@
+@Test
+fun `append fails closed while read context degrades and recovers`(
+    output: CapturedOutput,
+) {
+    val redisPort = ServerSocket(0).use { it.localPort }
+    val fixture = buildFixture(redisPort)
+    val turn = buildTurn()
+
+    try {
+        // Redis indisponível: escrita deve falhar
+        assertThrows<Exception> {
+            runBlocking {
+                fixture.memoryService.appendTurn(
+                    turn = turn,
+                    userId = "user-recovery",
+                )
+            }
+        }
+
+        // Redis indisponível: leitura protegida por fail-open degrada
+        val degraded = runBlocking {
+            fixture.memoryService.getConversationContext(
+                sessionId = turn.sessionId,
+                limit = 3,
+            )
+        }
+
+        assertThat(degraded).isNull()
+
+        assertThat(output.out)
+            .contains(
+                "Memory operation degraded for operation=findConversationContext"
+            )
+
+        val redis = startRedis(redisPort)
+
+        try {
+            /*
+             * O connection factory foi criado enquanto Redis estava offline.
+             * Forçamos a próxima operação a obter uma conexão válida.
+             */
+            fixture.connectionFactory.resetConnection()
+
+            waitUntilAvailable {
+                runBlocking {
+                    fixture.redisTemplate
+                        .opsForValue()
+                        .set("health:test", "ok")
+                        .awaitSingle()
+
+                    fixture.redisTemplate
+                        .delete("health:test")
+                        .awaitSingle()
+                }
+            }
+
+            // Agora validamos recuperação do comportamento real
+            runBlocking {
+                fixture.memoryService.appendTurn(
+                    turn = turn,
+                    userId = "user-recovery",
+                )
+            }
+
+            val turns = runBlocking {
+                fixture.memoryService.listTurns(
+                    sessionId = turn.sessionId,
+                    page = 0,
+                    size = 10,
+                )
+            }
+
+            val pending = runBlocking {
+                fixture.memoryService.findPendingTurns(limit = 10)
+            }
+
+            val context = runBlocking {
+                fixture.memoryService.getConversationContext(
+                    sessionId = turn.sessionId,
+                    limit = 2,
+                )
+            }
+
+            assertThat(
+                turns.content.map { it.chatHistoryId }
+            ).containsExactly(turn.chatHistoryId)
+
+            assertThat(pending)
+                .anyMatch {
+                    it.chatHistoryId == turn.chatHistoryId &&
+                        it.sessionId == turn.sessionId
+                }
+
+            assertThat(context)
+                .contains("Usuário: Qual é o contexto da sessão?")
+
+            assertThat(context)
+                .contains("Assistente: Contexto recuperado após reconexão")
+        } finally {
+            redis.stop()
+        }
+    } finally {
+        fixture.close()
+    }
+}
