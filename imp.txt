@@ -1,145 +1,208 @@
-interface SessionIndexRepository {
+@Service
+open class MemoryService(
+    private val sessionMemoryRepository: SessionMemoryRepository,
+    private val sessionIndexRepository: SessionIndexRepository,
+    private val contextCacheRepository: ContextCacheRepository,
+    private val failOpen: FailOpen,
+) {
 
-    suspend fun touch(
-        userId: String,
-        sessionId: String,
-        at: Instant = Instant.now(),
-    )
-
-    suspend fun listByUser(
-        userId: String,
-        page: Int,
-        size: Int,
-    ): PageResponse<String>
-}
-
-----
-
-@Repository
-open class RedisSessionIndexRepository(
-    private val redisTemplate: ReactiveStringRedisTemplate,
-    private val properties: IaraMemoryProperties,
-) : SessionIndexRepository {
-
-    override suspend fun touch(
-        userId: String,
-        sessionId: String,
-        at: Instant,
+    open suspend fun appendTurn(
+        turn: ConversationTurn,
+        userId: String?,
     ) {
-        validateIdentifiers(
-            userId = userId,
-            sessionId = sessionId,
+        sessionMemoryRepository.appendTurn(
+            sessionId = turn.sessionId,
+            turn = turn,
         )
 
-        val key =
-            CacheConstants.userSessionsKey(
-                properties.keyPrefix,
-                userId,
-            )
+        sessionMemoryRepository.addPendingTurn(
+            sessionId = turn.sessionId,
+            chatHistoryId = turn.chatHistoryId,
+        )
 
-        redisTemplate
-            .opsForZSet()
-            .add(
-                key,
-                sessionId,
-                at.toEpochMilli().toDouble(),
-            )
-            .awaitSingle()
-
-        redisTemplate
-            .expire(
-                key,
-                properties.sessionTtl,
-            )
-            .awaitSingle()
-    }
-
-    override suspend fun listByUser(
-        userId: String,
-        page: Int,
-        size: Int,
-    ): PageResponse<String> {
-        require(userId.length <= MAX_IDENTIFIER_LENGTH) {
-            "userId must have at most $MAX_IDENTIFIER_LENGTH characters"
+        userId?.let {
+            failOpen.failOpenWrite(
+                operation = "touchUserSession",
+            ) {
+                sessionIndexRepository.touch(
+                    userId = it,
+                    sessionId = turn.sessionId,
+                )
+            }
         }
 
-        val normalizedPage =
-            PageUtil.normalizePage(page)
-
-        val normalizedSize =
-            PageUtil.normalizeSizeCoerceIn(
-                size,
-                properties.maxPageSize,
+        failOpen.failOpenWrite(
+            operation = "evictConversationContext",
+        ) {
+            contextCacheRepository.evict(
+                turn.sessionId,
             )
+        }
+    }
 
-        val key =
-            CacheConstants.userSessionsKey(
-                properties.keyPrefix,
-                userId,
+    open suspend fun getConversationContext(
+        sessionId: String,
+        limit: Int? = null,
+    ): String? {
+        val cachedContext =
+            failOpen.failOpenRead(
+                operation = "findConversationContext",
+                default = null,
+            ) {
+                contextCacheRepository.find(sessionId)
+            }
+
+        if (!cachedContext.isNullOrBlank()) {
+            return cachedContext
+        }
+
+        val turns =
+            failOpen.failOpenRead(
+                operation = "findRecentTurns",
+                default = emptyList(),
+            ) {
+                sessionMemoryRepository.findRecentTurns(
+                    sessionId = sessionId,
+                    limit = limit,
+                )
+            }
+
+        if (turns.isEmpty()) {
+            return null
+        }
+
+        val context =
+            buildConversationContext(turns)
+
+        failOpen.failOpenWrite(
+            operation = "saveConversationContext",
+        ) {
+            contextCacheRepository.save(
+                sessionId = sessionId,
+                context = context,
             )
+        }
 
-        val total =
-            redisTemplate
-                .opsForZSet()
-                .size(key)
-                .awaitSingle()
+        return context
+    }
 
-        if (total == 0L) {
-            return PageResponse.of(
+    open suspend fun listTurns(
+        sessionId: String,
+        page: Int,
+        size: Int,
+    ): PageResponse<ConversationTurn> =
+        failOpen.failOpenRead(
+            operation = "listTurns",
+            default = PageResponse.of(
                 content = emptyList(),
                 total = 0,
-                page = normalizedPage,
-                size = normalizedSize,
+                page = page,
+                size = size,
+            ),
+        ) {
+            sessionMemoryRepository.listTurns(
+                sessionId = sessionId,
+                page = page,
+                size = size,
             )
         }
 
-        val start =
-            normalizedPage.toLong() *
-                normalizedSize.toLong()
-
-        val end =
-            start + normalizedSize.toLong() - 1
-
-        val sessionIds =
-            redisTemplate
-                .opsForZSet()
-                .reverseRange(
-                    key,
-                    Range.closed(start, end),
-                )
-                .collectList()
-                .awaitSingle()
-
-        return PageResponse.of(
-            content = sessionIds,
-            total = total,
-            page = normalizedPage,
-            size = normalizedSize,
-        )
-    }
-
-    private fun validateIdentifiers(
+    open suspend fun listSessionIds(
         userId: String,
+        page: Int,
+        size: Int,
+    ): PageResponse<String> =
+        failOpen.failOpenRead(
+            operation = "listSessionIds",
+            default = PageResponse.of(
+                content = emptyList(),
+                total = 0,
+                page = page,
+                size = size,
+            ),
+        ) {
+            sessionIndexRepository.listByUser(
+                userId = userId,
+                page = page,
+                size = size,
+            )
+        }
+
+    open suspend fun findTurn(
+        sessionId: String,
+        chatHistoryId: String,
+    ): ConversationTurn? =
+        failOpen.failOpenRead(
+            operation = "findTurn",
+            default = null,
+        ) {
+            sessionMemoryRepository.findTurn(
+                sessionId = sessionId,
+                chatHistoryId = chatHistoryId,
+            )
+        }
+
+    open suspend fun countTurns(
+        sessionId: String,
+    ): Long =
+        failOpen.failOpenRead(
+            operation = "countTurns",
+            default = 0L,
+        ) {
+            sessionMemoryRepository.countTurns(sessionId)
+        }
+
+    open suspend fun findPendingTurns(
+        limit: Long,
+    ): List<PendingTurnReference> =
+        sessionMemoryRepository.findPendingTurns(limit)
+
+    open suspend fun markTurnAsPersisted(
+        sessionId: String,
+        chatHistoryId: String,
+    ): Boolean =
+        sessionMemoryRepository.updateTurnPersistenceStatus(
+            sessionId = sessionId,
+            chatHistoryId = chatHistoryId,
+            persistStatus = PersistStatus.PERSISTED,
+        )
+
+    open suspend fun markTurnAsPending(
+        sessionId: String,
+        chatHistoryId: String,
+    ): Boolean =
+        sessionMemoryRepository.updateTurnPersistenceStatus(
+            sessionId = sessionId,
+            chatHistoryId = chatHistoryId,
+            persistStatus = PersistStatus.PENDING,
+        )
+
+    open suspend fun evictConversationContext(
         sessionId: String,
     ) {
-        require(userId.length <= MAX_IDENTIFIER_LENGTH) {
-            "userId must have at most $MAX_IDENTIFIER_LENGTH characters"
-        }
-
-        require(sessionId.length <= MAX_IDENTIFIER_LENGTH) {
-            "sessionId must have at most $MAX_IDENTIFIER_LENGTH characters"
+        failOpen.failOpenWrite(
+            operation = "evictConversationContext",
+        ) {
+            contextCacheRepository.evict(sessionId)
         }
     }
 
-    companion object {
-        private const val MAX_IDENTIFIER_LENGTH = 40
-    }
+    private fun buildConversationContext(
+        turns: List<ConversationTurn>,
+    ): String =
+        turns.joinToString(separator = "\n\n") { turn ->
+            buildString {
+                append("Usuário: ")
+                append(turn.question)
+
+                turn.answer
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { answer ->
+                        append("\nAssistente: ")
+                        append(answer)
+                    }
+            }
+        }
 }
 
-
-----
-import kotlinx.coroutines.reactor.awaitSingle
-import org.springframework.data.domain.Range
-import org.springframework.data.redis.core.ReactiveStringRedisTemplate
-import org.springframework.stereotype.Repository
-import java.time.Instant
+-----
