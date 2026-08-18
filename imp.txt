@@ -1,9 +1,12 @@
 @Service
-class ChatService(
+open class ChatService(
     private val memoryService: MemoryService,
 ) {
 
-    fun processQuestion(
+    private val logger =
+        LoggerFactory.getLogger(ChatService::class.java)
+
+    open fun processQuestion(
         request: ChatAskRequest,
         appName: String?,
         correlationId: String?,
@@ -22,33 +25,32 @@ class ChatService(
             )
 
         send(
-            ChatStreamEvent(
-                type = "session",
+            ChatStreamEvent.metadata(
                 sessionId = sessionId,
+                chatHistoryId = chatHistoryId,
             )
         )
 
         val completeResponse =
             generateMockResponse(
                 question = request.question,
-                requestContext = request.context,
-                conversationContext = conversationContext,
+                context = request.context,
+                previousContext = conversationContext,
             )
 
-        val answerBuilder = StringBuilder()
+        val answerBuilder =
+            StringBuilder()
 
         completeResponse
             .chunked(CHUNK_SIZE)
             .forEach { chunk ->
 
-                delay(CHUNK_DELAY)
+                delay(CHUNK_DELAY_MILLIS)
 
                 answerBuilder.append(chunk)
 
                 send(
-                    ChatStreamEvent(
-                        type = "chunk",
-                        sessionId = sessionId,
+                    ChatStreamEvent.message(
                         content = chunk,
                     )
                 )
@@ -58,10 +60,12 @@ class ChatService(
             ConversationTurn(
                 sessionId = sessionId,
                 chatHistoryId = chatHistoryId,
+                userName = request.namUser,
+                systemName = appName ?: DEFAULT_SYSTEM,
                 question = request.question,
                 answer = answerBuilder.toString(),
                 persistStatus = PersistStatus.PENDING,
-                // demais campos reais do seu model
+                createdAt = LocalDateTime.now(),
             )
 
         memoryService.appendTurn(
@@ -70,36 +74,180 @@ class ChatService(
         )
 
         send(
-            ChatStreamEvent(
-                type = "done",
+            ChatStreamEvent.complete(
                 sessionId = sessionId,
+                chatHistoryId = chatHistoryId,
             )
+        )
+    }
+
+    open suspend fun listSessions(
+        namUser: String,
+        page: Int,
+        size: Int,
+    ): PageResponse<String> {
+        return memoryService.listSessionIds(
+            userId = namUser,
+            page = page,
+            size = size,
+        )
+    }
+
+    open suspend fun getSession(
+        sessionId: String,
+        page: Int,
+        size: Int,
+        appName: String?,
+    ): ChatSessionResponse {
+
+        val chatHistory =
+            memoryService.listTurns(
+                sessionId = sessionId,
+                page = page,
+                size = size,
+            )
+
+        val messages =
+            chatHistory.content.map { turn ->
+                ChatHistoryItemResponse(
+                    chatHistoryId = turn.chatHistoryId,
+                    question = turn.question,
+                    answer = turn.answer,
+                    feedback = turn.feedback,
+                    createdAt = turn.createdAt,
+                )
+            }
+
+        return ChatSessionResponse(
+            sessionId = sessionId,
+            system = appName ?: DEFAULT_SYSTEM,
+            messages =
+                PageResponse(
+                    content = messages,
+                    pageable = chatHistory.pageable,
+                    totalElements = chatHistory.totalElements,
+                    totalPages = chatHistory.totalPages,
+                    first = chatHistory.first,
+                    last = chatHistory.last,
+                    empty = chatHistory.empty,
+                ),
+        )
+    }
+
+    open suspend fun clearSessionContext(
+        sessionId: String,
+    ): ClearContextResponse {
+
+        memoryService.evictConversationContext(
+            sessionId = sessionId,
+        )
+
+        logger.info(
+            "Cleaning session context: sessionId={}",
+            sessionId,
+        )
+
+        return ClearContextResponse.success(
+            sessionId = sessionId,
+        )
+    }
+
+    open suspend fun registerFeedback(
+        request: FeedbackRequest,
+        appName: String?,
+        correlationId: String?,
+    ): FeedbackResponse {
+
+        logger.info(
+            "Registering feedback: chatHistoryId={}, positive={}",
+            request.chatHistoryId,
+            request.positive,
+        )
+
+        /*
+         * Aqui ainda precisamos revisar a implementação real
+         * de feedback.
+         *
+         * Não colocaria mock novo.
+         */
+        return FeedbackResponse.success(
+            request.chatHistoryId,
         )
     }
 
     private fun generateMockResponse(
         question: String,
-        requestContext: Map<String, String>?,
-        conversationContext: String?,
+        context: Map<String, String>?,
+        previousContext: String?,
     ): String {
-        // ÚNICO MOCK.
-        // Mantemos aqui enquanto não houver integração real com o agente.
+        /*
+         * Único ponto mockado.
+         */
+        val normalizedQuestion =
+            question.trim().lowercase()
 
-        return """
-            Pergunta recebida: $question
+        return when {
+            normalizedQuestion.contains("dossiê") ||
+                normalizedQuestion.contains("dossie") -> {
 
-            Contexto da requisição:
-            ${requestContext.orEmpty()}
+                """
+                Com base na análise do dossiê:
 
-            Contexto da conversa:
-            ${conversationContext ?: "Sem histórico anterior."}
+                1. Status: Em análise
+                2. Alertas: 3 alertas de movimentação atípica
+                3. Valor total: R$ 523.450,00
+                """.trimIndent()
+            }
 
-            Esta é uma resposta simulada do agente Iara.
-        """.trimIndent()
+            normalizedQuestion.contains("alerta") -> {
+
+                """
+                O alerta foi gerado devido à detecção de padrões transacionais atípicos:
+
+                - Aumento de 340% no volume
+                - Fracionamento de valores
+                - Transações em horários atípicos
+                """.trimIndent()
+            }
+
+            normalizedQuestion.contains("transação") ||
+                normalizedQuestion.contains("pix") -> {
+
+                """
+                Transações do período:
+
+                - Total: 47 transações
+                - Valor: R$ 892.150,00
+                - Maior: R$ 154.357,00 (PIX)
+                """.trimIndent()
+            }
+
+            else -> {
+                buildString {
+                    previousContext
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let {
+                            appendLine("Contexto anterior considerado.")
+                            appendLine()
+                        }
+
+                    append(
+                        "Consulta processada. Para informações específicas sobre " +
+                            "dossiês, alertas ou transações, forneça mais detalhes."
+                    )
+                }
+            }
+        }
     }
 
     companion object {
-        private const val CHUNK_SIZE = 20
-        private const val CHUNK_DELAY = 200L
+        private const val DEFAULT_SYSTEM =
+            "gerenciador-pld-panel"
+
+        private const val CHUNK_SIZE =
+            20
+
+        private const val CHUNK_DELAY_MILLIS =
+            100L
     }
 }
